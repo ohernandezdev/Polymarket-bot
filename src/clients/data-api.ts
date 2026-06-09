@@ -795,7 +795,9 @@ export class DataApiClient {
     while (all.length < maxEntries) {
       const result = await this.fetchLeaderboard({ limit, offset });
       all.push(...result.entries);
-      if (!result.hasMore) break;
+      // Stop if a page returns nothing — otherwise an API that keeps reporting
+      // hasMore:true with an empty page would spin forever.
+      if (!result.hasMore || result.entries.length === 0) break;
       offset += limit;
     }
 

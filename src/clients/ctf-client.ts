@@ -25,6 +25,7 @@
 
 import { ethers, Contract, Wallet, BigNumber } from 'ethers';
 import { getPolygonProvider } from '../utils/provider';
+import { fetchWithTimeout } from '../utils/fetch-timeout';
 
 // ===== Contract Addresses (Polygon Mainnet) =====
 
@@ -712,8 +713,11 @@ export class CTFClient {
       conditionId,
       isResolved,
       winningOutcome,
-      payoutNumerators: [yesNumerator.toNumber(), noNumerator.toNumber()],
-      payoutDenominator: denominator.toNumber(),
+      // Via String() not .toNumber(): a large negRisk numerator/denominator exceeds
+      // Number.MAX_SAFE_INTEGER and .toNumber() THROWS "overflow". Number(bn.toString())
+      // never throws (may lose precision, irrelevant here — these are informational).
+      payoutNumerators: [Number(yesNumerator.toString()), Number(noNumerator.toString())],
+      payoutDenominator: Number(denominator.toString()),
     };
   }
 
@@ -797,13 +801,30 @@ export class CTFClient {
       return this.cachedMaticPrice;
     }
 
-    // In production, this would fetch from an oracle or price feed
-    // For now, we return a reasonable estimate
-    // Could integrate with Chainlink price feeds or CoinGecko API
-    this.cachedMaticPrice = DEFAULT_MATIC_PRICE;
-    this.maticPriceLastUpdated = now;
-
-    return this.cachedMaticPrice;
+    // Fetch the REAL price (no fabricated 0.50 fallback — a fake gas-cost-in-USD
+    // hides the real problem). On failure, reuse the last REAL cached value if we
+    // have one (stale but true); only throw if we never obtained a real price.
+    try {
+      const res = await fetchWithTimeout(
+        'https://api.coingecko.com/api/v3/simple/price?ids=matic-network&vs_currencies=usd'
+      );
+      if (!res.ok) throw new Error(`CoinGecko HTTP ${res.status}`);
+      const data = (await res.json()) as { 'matic-network'?: { usd?: number } };
+      const price = data['matic-network']?.usd;
+      if (!(typeof price === 'number' && price > 0)) {
+        throw new Error('CoinGecko returned no usable MATIC price');
+      }
+      this.cachedMaticPrice = price;
+      this.maticPriceLastUpdated = now;
+      return price;
+    } catch (err) {
+      if (this.maticPriceLastUpdated > 0) {
+        return this.cachedMaticPrice; // stale but real
+      }
+      throw new Error(
+        `Cannot determine MATIC price (no real value available): ${(err as Error).message}`
+      );
+    }
   }
 
   /**

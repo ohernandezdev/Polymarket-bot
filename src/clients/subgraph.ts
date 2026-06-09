@@ -214,9 +214,9 @@ export class SubgraphClient {
     if (params.where && Object.keys(params.where).length > 0) {
       // Build where clause manually to avoid JSON quote issues
       const whereParts = Object.entries(params.where).map(([key, value]) => {
-        if (typeof value === 'string') {
-          return `${key}: "${value}"`;
-        }
+        // JSON.stringify for strings too — a raw `"${value}"` left embedded quotes
+        // unescaped, breaking the query (or allowing GraphQL injection) for any value
+        // containing a double quote. GraphQL accepts JSON-quoted strings.
         return `${key}: ${JSON.stringify(value)}`;
       });
       args.push(`where: { ${whereParts.join(', ')} }`);

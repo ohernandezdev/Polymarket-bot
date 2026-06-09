@@ -213,8 +213,9 @@ export class BridgeClient {
       }>;
     };
 
-    // Normalize the API response to match our interface
-    return response.supportedAssets.map((asset) => ({
+    // Normalize the API response to match our interface. Guard against a missing
+    // field (API shape change / error body with 200) to avoid "map of undefined".
+    return (response.supportedAssets ?? []).map((asset) => ({
       chainId: parseInt(asset.chainId, 10),
       chainName: asset.chainName,
       tokenSymbol: asset.token.symbol,
@@ -748,7 +749,9 @@ export async function swapAndDeposit(
         amountIn: amount,
         usdcAmount: '0',
         depositAddress: depositAddr,
-        error: `Swap failed: ${swapResult.transactionHash}`,
+        // SwapResult has no error field; reference the tx hash for debugging instead
+        // of mislabeling it AS the error message (the old `error: ${transactionHash}`).
+        error: `Swap to USDC failed${swapResult.transactionHash ? ` (tx: ${swapResult.transactionHash})` : ''}`,
       };
     }
 

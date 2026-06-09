@@ -24,6 +24,7 @@
  */
 
 import { ethers, Contract, Wallet, BigNumber } from 'ethers';
+import { getPolygonProvider } from '../utils/provider';
 
 // ===== Contract Addresses (Polygon Mainnet) =====
 
@@ -192,7 +193,9 @@ export class CTFClient {
 
   constructor(config: CTFConfig) {
     const rpcUrl = config.rpcUrl || 'https://polygon-rpc.com';
-    this.provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+    // Pinned Polygon network (chainId 137) — skips the eth_chainId probe that throws
+    // "could not detect network (NETWORK_ERROR)" when the RPC rate-limits.
+    this.provider = getPolygonProvider(rpcUrl);
     this.wallet = new Wallet(config.privateKey, this.provider);
     this.ctfContract = new Contract(CTF_CONTRACT, CTF_ABI, this.wallet);
     this.usdcContract = new Contract(USDC_CONTRACT, ERC20_ABI, this.wallet);

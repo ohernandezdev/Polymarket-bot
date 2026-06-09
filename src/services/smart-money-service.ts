@@ -29,7 +29,37 @@
 import type { WalletService, TimePeriod, PeriodLeaderboardEntry } from './wallet-service.js';
 import type { RealtimeServiceV2, ActivityTrade } from './realtime-service-v2.js';
 import type { TradingService, OrderResult } from './trading-service.js';
+import type { MarketService } from './market-service.js';
 import type { Position, ClosedPosition, ClosedPositionsParams, DataApiClient } from '../clients/data-api.js';
+
+/**
+ * Maximum allowed price drift (absolute, in probability/price units 0..1) between
+ * the leader's executed trade price and the live CLOB midpoint at the moment we
+ * attempt to copy. If the live mid has moved more than this, the edge is gone and
+ * we ABORT the copy instead of chasing.
+ *
+ * Configurable via env `COPY_MAX_DRIFT` (default 0.02 = 2 cents of probability).
+ */
+const COPY_MAX_DRIFT: number = (() => {
+  const raw = process.env.COPY_MAX_DRIFT;
+  if (raw === undefined || raw === '') return 0.02;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(
+      `[SmartMoneyService] Invalid COPY_MAX_DRIFT="${raw}": must be a positive number (price units, e.g. 0.02)`
+    );
+  }
+  return parsed;
+})();
+
+/**
+ * TTL for the de-duplication cache of processed fills (ms).
+ *
+ * The Activity feed delivers BOTH a 'trade' and an 'orders_matched' event for the
+ * same on-chain fill. We key processed fills by `txHash:asset:side` and ignore
+ * repeats inside this window so a single fill is copied exactly once.
+ */
+const DEDUP_TTL_MS = 60_000;
 
 // ============================================================================
 // Market Categorization (exported utilities)
@@ -142,7 +172,11 @@ export interface AutoCopyTradingOptions {
   maxSlippage?: number;
   /** Order type: FOK or FAK */
   orderType?: 'FOK' | 'FAK';
-  /** Delay before executing (ms) */
+  /**
+   * @deprecated No-op. Copy signals are never artificially delayed — the edge
+   * decays immediately. Price safety is enforced by a live-midpoint drift check
+   * (COPY_MAX_DRIFT) just before placing the order, not by waiting.
+   */
   delay?: number;
 
   /** Minimum trade value to copy (USDC) */
@@ -681,6 +715,7 @@ export class SmartMoneyService {
   private walletService: WalletService;
   private realtimeService: RealtimeServiceV2;
   private tradingService: TradingService;
+  private marketService: MarketService | null;
   private dataApi: DataApiClient | null;
   private config: Required<SmartMoneyServiceConfig>;
 
@@ -691,22 +726,67 @@ export class SmartMoneyService {
   private activeSubscription: { unsubscribe: () => void } | null = null;
   private tradeHandlers: Set<(trade: SmartMoneyTrade) => void> = new Set();
 
+  /**
+   * De-dup cache keyed by `txHash:asset:side` → expiry timestamp (ms).
+   * The Activity feed emits both 'trade' and 'orders_matched' for the same fill;
+   * this ensures a single fill is copied exactly once. Entries auto-expire.
+   */
+  private processedFills: Map<string, number> = new Map();
+
+  /**
+   * In-flight copy locks keyed by tokenId. Prevents two concurrent signals for the
+   * same token from double-firing an order before the first one settles.
+   */
+  private inFlightTokens: Set<string> = new Set();
+
   constructor(
     walletService: WalletService,
     realtimeService: RealtimeServiceV2,
     tradingService: TradingService,
     config: SmartMoneyServiceConfig = {},
-    dataApi?: DataApiClient
+    dataApi?: DataApiClient,
+    marketService?: MarketService
   ) {
     this.walletService = walletService;
     this.realtimeService = realtimeService;
     this.tradingService = tradingService;
     this.dataApi = dataApi ?? null;
+    this.marketService = marketService ?? null;
 
     this.config = {
       minPnl: config.minPnl ?? 1000,
       cacheTtl: config.cacheTtl ?? 300000,
     };
+  }
+
+  /**
+   * Set the MarketService used for live orderbook / midpoint reads.
+   * Required for drift-aware copy trading (live mid vs leader trade price).
+   */
+  setMarketService(marketService: MarketService): void {
+    this.marketService = marketService;
+  }
+
+  /**
+   * Check whether a fill (identified by txHash/asset/side) has already been
+   * processed within the de-dup window. Marks it processed and returns false the
+   * first time; returns true on subsequent duplicate events for the same fill.
+   *
+   * Also opportunistically evicts expired entries to bound memory.
+   */
+  private isDuplicateFill(key: string): boolean {
+    const now = Date.now();
+
+    // Evict expired entries.
+    for (const [k, expiry] of this.processedFills) {
+      if (expiry <= now) this.processedFills.delete(k);
+    }
+
+    if (this.processedFills.has(key)) {
+      return true;
+    }
+    this.processedFills.set(key, now + DEDUP_TTL_MS);
+    return false;
   }
 
   /**
@@ -806,21 +886,56 @@ export class SmartMoneyService {
       filterAddresses?: string[];
       minSize?: number;
       smartMoneyOnly?: boolean;
+      onError?: (error: Error) => void;
     } = {}
   ): { id: string; unsubscribe: () => void } {
     this.tradeHandlers.add(onTrade);
 
-    // Ensure cache is populated
-    this.getSmartMoneyList().catch(() => {});
+    // Populate the smart-money set. NO FALLBACK: if this fails we surface the
+    // error instead of silently subscribing with an empty/partial followed set.
+    //
+    // When `smartMoneyOnly` is requested without explicit `filterAddresses`, the
+    // followed set IS the filter — a load failure would silently match nothing,
+    // so we treat it as fatal and propagate. Otherwise (explicit addresses) the
+    // set is only used to enrich the `isSmartMoney` flag, but we still log ERROR
+    // and notify rather than swallow.
+    const setIsRequiredForFilter =
+      options.smartMoneyOnly === true &&
+      !(options.filterAddresses && options.filterAddresses.length > 0);
+
+    this.getSmartMoneyList().catch((error: unknown) => {
+      const err = error instanceof Error ? error : new Error(String(error));
+      console.error(
+        '[SmartMoneyService] ERROR: failed to load smart-money list; followed set is empty/partial.',
+        err
+      );
+      options.onError?.(err);
+      if (setIsRequiredForFilter) {
+        // The subscription cannot do its job without the set — tear it down so
+        // callers do not believe they are following anyone.
+        this.tradeHandlers.delete(onTrade);
+        if (this.tradeHandlers.size === 0 && this.activeSubscription) {
+          this.activeSubscription.unsubscribe();
+          this.activeSubscription = null;
+        }
+      }
+    });
 
     // Start subscription if not active
     if (!this.activeSubscription) {
       this.activeSubscription = this.realtimeService.subscribeAllActivity({
         onTrade: (activityTrade: ActivityTrade) => {
-          this.handleActivityTrade(activityTrade, options);
+          // handleActivityTrade is async; a rejection here must not become an
+          // unhandled rejection — log ERROR and forward, never swallow silently.
+          this.handleActivityTrade(activityTrade, options).catch((error: unknown) => {
+            const err = error instanceof Error ? error : new Error(String(error));
+            console.error('[SmartMoneyService] ERROR: activity handler failed:', err);
+            options.onError?.(err);
+          });
         },
         onError: (error) => {
           console.error('[SmartMoneyService] Subscription error:', error);
+          options.onError?.(error instanceof Error ? error : new Error(String(error)));
         },
       });
     }
@@ -846,11 +961,24 @@ export class SmartMoneyService {
 
     const traderAddress = rawAddress.toLowerCase();
 
-    // Address filter
+    // Address filter FIRST — the Activity feed carries the WHOLE platform's volume;
+    // filtering to followed wallets before the dedup bookkeeping bounds the
+    // processedFills Map to our wallets (~1000× smaller) instead of global volume.
     if (options.filterAddresses && options.filterAddresses.length > 0) {
       const normalized = options.filterAddresses.map(a => a.toLowerCase());
       if (!normalized.includes(traderAddress)) return;
     }
+
+    // De-dup (E3): the Activity feed emits BOTH a 'trades' and an 'orders_matched'
+    // event for the SAME on-chain fill. Process a given fill exactly once. Prefer
+    // the txHash; when it is absent (orders_matched often omits it) fall back to a
+    // composite NATURAL key of the fill's invariant fields — this is not a fabricated
+    // value, it is the fill's identity, so the two events collapse to one. Without
+    // this the txHash-less event slipped through and the copy fired TWICE.
+    const dedupKey = trade.transactionHash
+      ? `${trade.transactionHash}:${trade.asset}:${trade.side}`
+      : `${traderAddress}:${trade.asset}:${trade.side}:${trade.price}:${trade.size}:${trade.timestamp}`;
+    if (this.isDuplicateFill(dedupKey)) return;
 
     // Size filter
     if (options.minSize && trade.size < options.minSize) return;
@@ -949,8 +1077,20 @@ export class SmartMoneyService {
     const orderType = options.orderType ?? 'FOK';
     const minTradeSize = options.minTradeSize ?? 10;
     const sideFilter = options.sideFilter;
-    const delay = options.delay ?? 0;
     const dryRun = options.dryRun ?? false;
+    // NOTE: `options.delay` is intentionally ignored. We do NOT sit on a copy
+    // signal — the edge decays immediately and we instead validate the live mid
+    // via a drift check just before placing the order (see COPY_MAX_DRIFT below).
+
+    // Drift-aware copy requires live market reads. NO FALLBACK: a live (non-dry)
+    // run without a MarketService cannot verify the price hasn't moved, so we
+    // refuse to start rather than place blind copies.
+    if (!dryRun && !this.marketService) {
+      throw new Error(
+        '[SmartMoneyService] startAutoCopyTrading: live copy trading requires a MarketService ' +
+        'for orderbook/midpoint drift checks. Pass it to the constructor or call setMarketService().'
+      );
+    }
 
     // Subscribe
     const subscription = this.subscribeSmartMoneyTrades(
@@ -975,6 +1115,13 @@ export class SmartMoneyService {
             return;
           }
 
+          // Token
+          const tokenId = trade.tokenId;
+          if (!tokenId) {
+            stats.tradesSkipped++;
+            return;
+          }
+
           // Calculate size
           let copySize = trade.size * sizeScale;
           let copyValue = copySize * trade.price;
@@ -992,60 +1139,102 @@ export class SmartMoneyService {
             return;
           }
 
-          // Delay
-          if (delay > 0) {
-            await new Promise(resolve => setTimeout(resolve, delay));
-          }
-
-          // Token
-          const tokenId = trade.tokenId;
-          if (!tokenId) {
+          // In-flight lock (E3): never fire two concurrent copies for the same
+          // token. If one is already in flight, skip this signal rather than
+          // stacking orders on a price that is already moving.
+          if (this.inFlightTokens.has(tokenId)) {
             stats.tradesSkipped++;
             return;
           }
+          this.inFlightTokens.add(tokenId);
 
-          // Price with slippage
-          const slippagePrice = trade.side === 'BUY'
-            ? trade.price * (1 + maxSlippage)
-            : trade.price * (1 - maxSlippage);
+          try {
+            // S2: orderbook-aware drift abort. Read the LIVE midpoint and bail if
+            // it has drifted more than COPY_MAX_DRIFT from the leader's executed
+            // price. The edge is gone if the price already moved — do not chase.
+            // Only meaningful for live execution (dry-run has no real market to
+            // hit); we still gate on marketService availability above for live.
+            if (!dryRun && this.marketService) {
+              const liveMid = await this.marketService.getMidpoint(tokenId);
+              if (!Number.isFinite(liveMid)) {
+                throw new Error(
+                  `[SmartMoneyService] live midpoint for token ${tokenId} is not a finite number (${liveMid})`
+                );
+              }
+              const drift = Math.abs(liveMid - trade.price);
+              if (drift > COPY_MAX_DRIFT) {
+                stats.tradesSkipped++;
+                console.warn(
+                  `[SmartMoneyService] copy aborted: live mid ${liveMid.toFixed(4)} drifted ` +
+                  `${drift.toFixed(4)} from leader price ${trade.price.toFixed(4)} ` +
+                  `(max ${COPY_MAX_DRIFT}) on ${trade.marketSlug ?? tokenId}`
+                );
+                return;
+              }
+            }
 
-          const usdcAmount = copyValue; // Already calculated above
+            // Price with slippage
+            const slippagePrice = trade.side === 'BUY'
+              ? trade.price * (1 + maxSlippage)
+              : trade.price * (1 - maxSlippage);
 
-          // Execute
-          let result: OrderResult;
+            // S4 (units bug): the CLOB market order `amount` field means different
+            // things per side:
+            //   - BUY  → amount is USDC notional to spend.
+            //   - SELL → amount is the number of SHARES to sell.
+            // Passing USDC on a SELL sells the wrong quantity. Branch by side.
+            const orderAmount = trade.side === 'BUY' ? copyValue : copySize;
 
-          if (dryRun) {
-            result = { success: true, orderId: `dry_run_${Date.now()}` };
-            console.log('[DRY RUN]', {
-              trader: trade.traderAddress.slice(0, 10),
-              side: trade.side,
-              market: trade.marketSlug,
-              copy: { size: copySize.toFixed(2), usdc: usdcAmount.toFixed(2) },
-            });
-          } else {
-            result = await this.tradingService.createMarketOrder({
-              tokenId,
-              side: trade.side,
-              amount: usdcAmount,
-              price: slippagePrice,
-              orderType,
-            });
+            // Execute
+            let result: OrderResult;
+
+            if (dryRun) {
+              result = { success: true, orderId: `dry_run_${Date.now()}` };
+              console.log('[DRY RUN]', {
+                trader: trade.traderAddress.slice(0, 10),
+                side: trade.side,
+                market: trade.marketSlug,
+                copy: {
+                  shares: copySize.toFixed(2),
+                  usdc: copyValue.toFixed(2),
+                  amountSent: orderAmount.toFixed(2),
+                },
+              });
+            } else {
+              result = await this.tradingService.createMarketOrder({
+                tokenId,
+                side: trade.side,
+                amount: orderAmount,
+                price: slippagePrice,
+                orderType,
+              });
+            }
+
+            if (result.success) {
+              stats.tradesExecuted++;
+              // Track spend in USDC notional regardless of side.
+              stats.totalUsdcSpent += copyValue;
+            } else {
+              stats.tradesFailed++;
+            }
+
+            options.onTrade?.(trade, result);
+          } finally {
+            this.inFlightTokens.delete(tokenId);
           }
-
-          if (result.success) {
-            stats.tradesExecuted++;
-            stats.totalUsdcSpent += usdcAmount;
-          } else {
-            stats.tradesFailed++;
-          }
-
-          options.onTrade?.(trade, result);
         } catch (error) {
           stats.tradesFailed++;
           options.onError?.(error instanceof Error ? error : new Error(String(error)));
         }
       },
-      { filterAddresses: targetAddresses, minSize: minTradeSize }
+      {
+        filterAddresses: targetAddresses,
+        // NOTE: do NOT pass `minSize` here — that filter compares SHARES against a
+        // USDC threshold (unit mismatch). The authoritative size gate is the
+        // value-based `tradeValue = size*price < minTradeSize` check in the copy
+        // handler below, which compares USDC to USDC.
+        onError: options.onError,
+      }
     );
 
     return {
@@ -2273,5 +2462,7 @@ export class SmartMoneyService {
     this.tradeHandlers.clear();
     this.smartMoneyCache.clear();
     this.smartMoneySet.clear();
+    this.processedFills.clear();
+    this.inFlightTokens.clear();
   }
 }

@@ -12,6 +12,7 @@
 import {
   DataApiClient,
   Position,
+  ClosedPosition,
   Activity,
   LeaderboardEntry,
   LeaderboardResult,
@@ -164,6 +165,62 @@ export interface WalletProfile {
   lastActiveAt: Date;
 }
 
+/**
+ * Realized performance stats computed from CLOSED/resolved positions only.
+ *
+ * This is the survivorship-bias-free counterpart to the open-position metrics
+ * exposed by {@link WalletProfile}. Open positions can show "winning" cashPnl
+ * (unrealized) that later reverses, so wallet qualification MUST score on the
+ * realized record returned by `closed-positions`.
+ *
+ * When the wallet does not have enough CLOSED trades to evaluate
+ * (`closedTrades < minClosedTrades`), `qualified` is `false` and
+ * `insufficientHistory` is `true`. Callers MUST treat this as "cannot evaluate"
+ * — they must NOT read winRate/profitFactor as if they were 0% / 0x, because
+ * a wallet with 2 closed trades is unknown, not bad.
+ */
+export interface RealizedStats {
+  address: string;
+  /** Number of CLOSED/resolved trades evaluated */
+  closedTrades: number;
+  /** Win rate over CLOSED trades only (0-1) */
+  winRate: number;
+  /** Sum of realized wins / sum of |realized losses|. Infinity when there are wins and zero losses. */
+  profitFactor: number;
+  /** Total realized PnL across all CLOSED trades (USDC) */
+  realizedPnL: number;
+  /** Number of closed trades with realizedPnl > 0 */
+  winningTrades: number;
+  /** Number of closed trades with realizedPnl < 0 */
+  losingTrades: number;
+  /** Sum of realized wins (USDC) */
+  grossProfit: number;
+  /** Sum of |realized losses| (USDC) */
+  grossLoss: number;
+  /** Average realized win (USDC) */
+  avgWin: number;
+  /** Average realized loss as a positive number (USDC) */
+  avgLoss: number;
+  /** Largest single realized win (USDC) */
+  maxWin: number;
+  /** Largest single realized loss as a positive number (USDC) */
+  maxLoss: number;
+  /** Minimum number of CLOSED trades that was required to qualify */
+  minClosedTrades: number;
+  /**
+   * True when there were not enough CLOSED trades to evaluate the wallet.
+   * When true, the metric fields above describe whatever sparse history exists
+   * and MUST NOT be used as a pass/fail signal.
+   */
+  insufficientHistory: boolean;
+  /**
+   * Convenience flag: there is enough closed history to make a judgment.
+   * Equivalent to `!insufficientHistory`. Does NOT mean the wallet is "good" —
+   * the caller still applies its own winRate/profitFactor thresholds.
+   */
+  qualified: boolean;
+}
+
 export interface WalletActivityOptions {
   /** Maximum number of activities to return */
   limit?: number;
@@ -270,6 +327,128 @@ export class WalletService {
         ? positions.filter((p) => (p.cashPnl || 0) > 0).length / positions.length
         : 0,
       lastActiveAt: lastActivity ? new Date(lastActivity.timestamp) : new Date(0),
+    };
+  }
+
+  /**
+   * Fetch ALL closed/resolved positions for a wallet with pagination.
+   *
+   * Mirrors the realized-history pattern in smart-money-service.ts so wallet
+   * qualification scores on the same resolved dataset. The closed-positions
+   * endpoint caps `limit` at 50; we page until exhausted or `maxItems`.
+   *
+   * @param address - Wallet address
+   * @param maxItems - Safety cap on total closed positions fetched (default 10000)
+   */
+  private async fetchAllClosedPositions(
+    address: string,
+    maxItems = 10000
+  ): Promise<ClosedPosition[]> {
+    const all: ClosedPosition[] = [];
+    const limit = 50; // API hard cap for closed-positions
+    let offset = 0;
+
+    while (all.length < maxItems) {
+      const page = await this.dataApi.getClosedPositions(address, {
+        limit,
+        offset,
+        sortBy: 'TIMESTAMP',
+        sortDirection: 'DESC',
+      });
+
+      if (page.length === 0) break;
+
+      all.push(...page);
+      offset += limit;
+
+      // Less than a full page means we've reached the end
+      if (page.length < limit) break;
+    }
+
+    return all.slice(0, maxItems);
+  }
+
+  /**
+   * Compute REALIZED performance stats from CLOSED/resolved positions only.
+   *
+   * This is the correct, survivorship-bias-free basis for wallet qualification.
+   * `getWalletProfile().winRate` scores `cashPnl > 0` over OPEN positions, where
+   * `cashPnl` is UNREALIZED — open "winners" frequently reverse before they
+   * resolve, inflating the score. Here we use `realizedPnl` from the
+   * `closed-positions` endpoint (the same field smart-money-service.ts uses).
+   *
+   * Qualification requires a minimum number of CLOSED trades. When the wallet
+   * has fewer than `minClosedTrades` resolved trades, the returned object has
+   * `insufficientHistory: true` and `qualified: false`. In that case the
+   * winRate / profitFactor fields are NOT a verdict — they merely describe the
+   * sparse sample. Callers MUST NOT treat "insufficient history" as a failing
+   * 0% / 0x wallet; they must skip or defer the wallet instead.
+   *
+   * @param address - Wallet address
+   * @param minClosedTrades - Minimum CLOSED/resolved trades required to evaluate (default 30)
+   *
+   * @example
+   * ```typescript
+   * const stats = await walletService.getRealizedStats(addr, 30);
+   * if (stats.insufficientHistory) {
+   *   // Cannot judge — not enough resolved trades. Skip, do NOT reject as 0%.
+   *   continue;
+   * }
+   * if (stats.winRate >= 0.55 && stats.profitFactor >= 1.5) {
+   *   qualify(addr);
+   * }
+   * ```
+   */
+  async getRealizedStats(
+    address: string,
+    minClosedTrades = 30,
+    maxScan = 500
+  ): Promise<RealizedStats> {
+    // Scan only the most-recent `maxScan` CLOSED trades (sorted TIMESTAMP DESC).
+    // Paginating a wallet's ENTIRE history (some have 10k+ closed → 200+ sequential
+    // API calls) made qualification take many minutes and stall the bot. The recent
+    // window is statistically robust for win-rate/profit-factor and ~20× faster.
+    const closed = await this.fetchAllClosedPositions(address, maxScan);
+
+    const wins = closed.filter((p) => p.realizedPnl > 0);
+    const losses = closed.filter((p) => p.realizedPnl < 0);
+
+    const grossProfit = wins.reduce((sum, p) => sum + p.realizedPnl, 0);
+    const grossLoss = Math.abs(losses.reduce((sum, p) => sum + p.realizedPnl, 0));
+    const realizedPnL = closed.reduce((sum, p) => sum + p.realizedPnl, 0);
+
+    const closedTrades = closed.length;
+    const winRate = closedTrades > 0 ? wins.length / closedTrades : 0;
+
+    // Profit factor: gross profit / gross loss. When there are zero losses,
+    // it is genuinely Infinity (only if there were actual wins); with no wins
+    // and no losses it is 0. We do NOT clamp to a fake "999" sentinel — callers
+    // compare against a threshold, and Infinity correctly clears any finite bar.
+    const profitFactor =
+      grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? Infinity : 0;
+
+    const insufficientHistory = closedTrades < minClosedTrades;
+
+    return {
+      address,
+      closedTrades,
+      winRate,
+      profitFactor,
+      realizedPnL,
+      winningTrades: wins.length,
+      losingTrades: losses.length,
+      grossProfit,
+      grossLoss,
+      avgWin: wins.length > 0 ? grossProfit / wins.length : 0,
+      avgLoss: losses.length > 0 ? grossLoss / losses.length : 0,
+      maxWin: wins.length > 0 ? Math.max(...wins.map((p) => p.realizedPnl)) : 0,
+      maxLoss:
+        losses.length > 0
+          ? Math.max(...losses.map((p) => Math.abs(p.realizedPnl)))
+          : 0,
+      minClosedTrades,
+      insufficientHistory,
+      qualified: !insufficientHistory,
     };
   }
 
@@ -829,7 +1008,10 @@ export class WalletService {
       // 卖出：减少持仓，计算已实现盈亏
       const sellAmount = Math.min(trade.tokenAmount, position.amount);
       const costBasis = sellAmount * position.avgCost;
-      const revenue = (sellAmount / trade.tokenAmount) * trade.usdcAmount;
+      // Guard against a degenerate 0-token fill (0/0 = NaN poisoning realizedPnl).
+      const revenue = trade.tokenAmount > 0
+        ? (sellAmount / trade.tokenAmount) * trade.usdcAmount
+        : 0;
       const realizedPnl = revenue - costBasis;
 
       const newAmount = position.amount - sellAmount;

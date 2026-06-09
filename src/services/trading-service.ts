@@ -113,6 +113,11 @@ export interface OrderResult {
   orderIds?: string[];
   errorMsg?: string;
   transactionHashes?: string[];
+  /** Real volume-weighted fill price, when the CLOB response exposes amounts.
+   *  Used to compute realized PnL from the ACTUAL fill, never the leader's price. */
+  avgPrice?: number;
+  /** Real filled size (shares), when exposed by the CLOB response. */
+  filledSize?: number;
 }
 
 export interface TradeInfo {
@@ -392,12 +397,31 @@ export class TradingService {
             ((result.orderID !== undefined && result.orderID !== '') ||
               (result.transactionsHashes !== undefined && result.transactionsHashes.length > 0)));
 
+        // Derive the REAL volume-weighted fill price when the CLOB response exposes
+        // matched amounts. Only set when finite and a valid probability — never
+        // fabricate; callers use the contractual limit price (worst case), not the
+        // leader's price, when this is absent.
+        const r = result as Record<string, unknown>;
+        const making = Number(r.makingAmount);
+        const taking = Number(r.takingAmount);
+        let avgPrice: number | undefined;
+        let filledSize: number | undefined;
+        if (isFinite(making) && isFinite(taking) && making > 0 && taking > 0) {
+          // SELL: making = shares out, taking = USDC in → price = taking/making.
+          // BUY:  making = USDC out, taking = shares in → price = making/taking.
+          if (params.side === 'SELL') { avgPrice = taking / making; filledSize = making; }
+          else { avgPrice = making / taking; filledSize = taking; }
+          if (!(avgPrice > 0 && avgPrice < 1)) { avgPrice = undefined; filledSize = undefined; }
+        }
+
         return {
           success,
           orderId: result.orderID,
           orderIds: result.orderIDs,
           errorMsg: result.errorMsg,
           transactionHashes: result.transactionsHashes,
+          avgPrice,
+          filledSize,
         };
       } catch (error) {
         return {

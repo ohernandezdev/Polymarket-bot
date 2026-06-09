@@ -37,6 +37,7 @@
 import { RateLimiter, ApiType } from '../core/rate-limiter.js';
 import type { UnifiedCache } from '../core/unified-cache.js';
 import { PolymarketError } from '../core/errors.js';
+import { fetchWithTimeout } from '../utils/fetch-timeout.js';
 
 /** Gamma API base URL */
 const GAMMA_API_BASE = 'https://gamma-api.polymarket.com';
@@ -373,7 +374,7 @@ export class GammaApiClient {
     if (params?.tag) query.set('tag', params.tag);
 
     return this.rateLimiter.execute(ApiType.GAMMA_API, async () => {
-      const response = await fetch(`${GAMMA_API_BASE}/markets?${query}`);
+      const response = await fetchWithTimeout(`${GAMMA_API_BASE}/markets?${query}`);
       if (!response.ok)
         throw PolymarketError.fromHttpError(
           response.status,
@@ -454,7 +455,7 @@ export class GammaApiClient {
     if (params?.limit) query.set('limit', String(params.limit));
 
     return this.rateLimiter.execute(ApiType.GAMMA_API, async () => {
-      const response = await fetch(`${GAMMA_API_BASE}/events?${query}`);
+      const response = await fetchWithTimeout(`${GAMMA_API_BASE}/events?${query}`);
       if (!response.ok)
         throw PolymarketError.fromHttpError(
           response.status,
@@ -498,7 +499,7 @@ export class GammaApiClient {
    */
   async getEventById(id: string): Promise<GammaEvent | null> {
     return this.rateLimiter.execute(ApiType.GAMMA_API, async () => {
-      const response = await fetch(`${GAMMA_API_BASE}/events/${id}`);
+      const response = await fetchWithTimeout(`${GAMMA_API_BASE}/events/${id}`);
       if (!response.ok) {
         if (response.status === 404) return null;
         throw PolymarketError.fromHttpError(
@@ -563,9 +564,10 @@ export class GammaApiClient {
       question: String(m.question || ''),
       description: m.description ? String(m.description) : undefined,
       outcomes: this.parseJsonArray(m.outcomes, ['Yes', 'No']),
-      outcomePrices: this.parseJsonArray(m.outcomePrices, [0.5, 0.5]).map(
-        Number
-      ),
+      // NO price fallback: if Gamma omits outcomePrices (closed/archived markets),
+      // return [] so callers DISCARD the market instead of trading on a fabricated
+      // 50/50. Inventing 0.5 here was a silent fake signal.
+      outcomePrices: this.parseJsonArray<number>(m.outcomePrices, []).map(Number),
       volume: Number(m.volume || 0),
       volume24hr: m.volume24hr !== undefined ? Number(m.volume24hr) : undefined,
       volume1wk: m.volume1wk !== undefined ? Number(m.volume1wk) : undefined,

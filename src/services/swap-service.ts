@@ -421,13 +421,23 @@ export class SwapService {
       await approveTx.wait();
     }
 
+    // Quote the full path and apply slippage — never amountOutMinimum:0 (no MEV
+    // protection → the whole multi-hop output could be sandwiched away).
+    const quote = await this.quoter.callStatic.quoteExactInput(path, amountInWei);
+    const expectedOut: BigNumber = quote.amountOut;
+    if (!expectedOut || expectedOut.lte(0)) {
+      throw new Error(`Quoter returned no output for route ${route.join('→')}; refusing to swap without slippage protection`);
+    }
+    const slippageBps = Math.floor(slippage * 100);
+    const amountOutMinimum = expectedOut.mul(10000 - slippageBps).div(10000);
+
     // Execute multi-hop swap
     const swapParams = {
       path,
       recipient: this.signer.address,
       deadline: Math.floor(Date.now() / 1000) + deadline,
       amountIn: amountInWei,
-      amountOutMinimum: 0, // For simplicity; in production use quote with slippage
+      amountOutMinimum,
     };
 
     const tx = await this.router.exactInput(swapParams, { ...gasOptions, gasLimit: 500000 });
@@ -619,10 +629,21 @@ export class SwapService {
       const slippageBps = Math.floor(slippage * 100);
       minAmountOut = estimatedOut.mul(10000 - slippageBps).div(10000);
     } else {
-      // For non-stablecoin pairs (like MATIC → USDC), set minAmountOut to 0
-      // The actual protection comes from the DEX's price oracle
-      // In production, you should use a quoter contract for accurate price
-      minAmountOut = BigNumber.from(0);
+      // Non-stablecoin pairs (e.g. MATIC → USDC): query the on-chain quoter for the
+      // expected output and apply slippage. minAmountOut=0 (the old code) gave ZERO
+      // slippage protection → a sandwich bot could drain almost the entire output.
+      const quote = await this.quoter.callStatic.quoteExactInputSingle(
+        tokenInAddress,
+        tokenOutAddress,
+        amountInWei,
+        0 // no price limit
+      );
+      const expectedOut: BigNumber = quote.amountOut;
+      if (!expectedOut || expectedOut.lte(0)) {
+        throw new Error(`Quoter returned no output for ${actualTokenIn}→${upperTokenOut}; refusing to swap without slippage protection`);
+      }
+      const slippageBps = Math.floor(slippage * 100);
+      minAmountOut = expectedOut.mul(10000 - slippageBps).div(10000);
     }
 
     // Execute swap

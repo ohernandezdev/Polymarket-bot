@@ -267,6 +267,9 @@ export class RealtimeServiceV2 extends EventEmitter {
   private bookCache: Map<string, OrderbookSnapshot> = new Map();
   private lastTradeCache: Map<string, LastTradeInfo> = new Map();
 
+  // Rate-limit state for error logging (per-context timestamp of last emitted ERROR log)
+  private lastErrorLogAt: Map<string, number> = new Map();
+
   constructor(config: RealtimeServiceConfig = {}) {
     super();
     this.config = {
@@ -493,7 +496,9 @@ export class RealtimeServiceV2 extends EventEmitter {
       { topic: 'clob_market', type: 'market_resolved' },
     ];
 
-    this.sendSubscription({ subscriptions });
+    const subMsg = { subscriptions };
+    this.sendSubscription(subMsg);
+    this.subscriptionMessages.set(subId, subMsg);  // Store for reconnection replay
 
     const handler = (event: MarketEvent) => handlers.onMarketEvent?.(event);
     this.on('marketEvent', handler);
@@ -506,6 +511,7 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('marketEvent', handler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subscriptionMessages.delete(subId);  // Remove from reconnection list
       },
     };
 
@@ -529,7 +535,9 @@ export class RealtimeServiceV2 extends EventEmitter {
       { topic: 'clob_user', type: '*', clob_auth: credentials },
     ];
 
-    this.sendSubscription({ subscriptions });
+    const subMsg = { subscriptions };
+    this.sendSubscription(subMsg);
+    this.subscriptionMessages.set(subId, subMsg);  // Store (incl. clob_auth) for reconnection replay
 
     const orderHandler = (order: UserOrder) => handlers.onOrder?.(order);
     const tradeHandler = (trade: UserTrade) => handlers.onTrade?.(trade);
@@ -546,6 +554,7 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('userTrade', tradeHandler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subscriptionMessages.delete(subId);  // Remove from reconnection list
       },
     };
 
@@ -586,7 +595,9 @@ export class RealtimeServiceV2 extends EventEmitter {
           { topic: 'activity', type: 'orders_matched' },
         ];
 
-    this.sendSubscription({ subscriptions });
+    const subMsg = { subscriptions };
+    this.sendSubscription(subMsg);
+    this.subscriptionMessages.set(subId, subMsg);  // Store for reconnection replay (fixes silently-dropped activity feed)
 
     const handler = (trade: ActivityTrade) => handlers.onTrade?.(trade);
     this.on('activityTrade', handler);
@@ -599,6 +610,7 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('activityTrade', handler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subscriptionMessages.delete(subId);  // Remove from reconnection list
       },
     };
 
@@ -635,6 +647,7 @@ export class RealtimeServiceV2 extends EventEmitter {
     }));
 
     this.sendSubscription({ subscriptions });
+    this.subscriptionMessages.set(subId, { subscriptions }); // replay on reconnect (else feed dies silently)
 
     const handler = (price: CryptoPrice) => {
       if (symbols.includes(price.symbol)) {
@@ -651,6 +664,7 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('cryptoPrice', handler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subscriptionMessages.delete(subId);
       },
     };
 
@@ -717,6 +731,7 @@ export class RealtimeServiceV2 extends EventEmitter {
     }));
 
     this.sendSubscription({ subscriptions });
+    this.subscriptionMessages.set(subId, { subscriptions }); // replay on reconnect (else feed dies silently)
 
     const handler = (price: EquityPrice) => {
       if (symbols.includes(price.symbol)) {
@@ -733,6 +748,7 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('equityPrice', handler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subscriptionMessages.delete(subId);
       },
     };
 
@@ -768,6 +784,7 @@ export class RealtimeServiceV2 extends EventEmitter {
     ];
 
     this.sendSubscription({ subscriptions });
+    this.subscriptionMessages.set(subId, { subscriptions }); // replay on reconnect (else feed dies silently)
 
     const commentHandler = (comment: Comment) => handlers.onComment?.(comment);
     const reactionHandler = (reaction: Reaction) => handlers.onReaction?.(reaction);
@@ -784,6 +801,7 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('reaction', reactionHandler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subscriptionMessages.delete(subId);
       },
     };
 
@@ -816,6 +834,7 @@ export class RealtimeServiceV2 extends EventEmitter {
     ];
 
     this.sendSubscription({ subscriptions });
+    this.subscriptionMessages.set(subId, { subscriptions }); // replay on reconnect (else feed dies silently)
 
     const requestHandler = (request: RFQRequest) => handlers.onRequest?.(request);
     const quoteHandler = (quote: RFQQuote) => handlers.onQuote?.(quote);
@@ -832,6 +851,7 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('rfqQuote', quoteHandler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subscriptionMessages.delete(subId);
       },
     };
 
@@ -901,13 +921,35 @@ export class RealtimeServiceV2 extends EventEmitter {
     this.connected = true;
     this.log('Connected to WebSocket server');
 
-    // Re-subscribe to all active subscriptions on reconnect
+    // Re-subscribe to ALL stored subscriptions on (re)connect. This is what keeps
+    // the activity/user/market-event feeds alive across a WebSocket reconnect — every
+    // subscribe* method persists its message into subscriptionMessages so it replays here.
     if (this.subscriptionMessages.size > 0) {
       this.log(`Re-subscribing to ${this.subscriptionMessages.size} subscriptions...`);
+      // Signal observers (dashboards/strategies) that a replay is happening.
+      this.emit('reconnecting', { count: this.subscriptionMessages.size });
+
+      let replayed = 0;
       for (const [subId, msg] of this.subscriptionMessages) {
         this.log(`Re-subscribing: ${subId}`);
-        this.client?.subscribe(msg);
+        if (!this.client) {
+          // Connection vanished mid-replay — do NOT silently continue as if subscribed.
+          const error = new Error(
+            `Reconnect replay aborted: WebSocket client is null after ${replayed}/${this.subscriptionMessages.size} subscriptions (last attempted: ${subId})`
+          );
+          this.emitError('handleConnect.replay', error);
+          return;
+        }
+        try {
+          this.client.subscribe(msg);
+          replayed++;
+        } catch (err) {
+          // NO FALLBACK: surface the replay failure instead of dropping the feed silently.
+          const error = err instanceof Error ? err : new Error(String(err));
+          this.emitError(`handleConnect.replay (${subId})`, error);
+        }
       }
+      this.log(`Re-subscribed ${replayed}/${this.subscriptionMessages.size} subscriptions`);
     }
 
     this.emit('connected');
@@ -1242,6 +1284,35 @@ export class RealtimeServiceV2 extends EventEmitter {
     if (this.config.debug) {
       console.log(`[RealtimeService] ${message}`);
     }
+  }
+
+  /**
+   * Log an error. Unlike log(), this is NOT gated behind debug — failures must always
+   * surface. Rate-limited per error context (min 5s between identical contexts) to avoid
+   * flooding logs during a reconnect storm, without ever swallowing the failure.
+   */
+  private logError(context: string, error: Error): void {
+    const now = Date.now();
+    const last = this.lastErrorLogAt.get(context) ?? 0;
+    if (now - last >= 5000) {
+      this.lastErrorLogAt.set(context, now);
+      console.error(`[RealtimeService][ERROR] ${context}: ${error.message}`, error);
+    }
+  }
+
+  /**
+   * Surface an error: always log it (rate-limited), then make it observable.
+   * Node's EventEmitter throws on emit('error') when there is no 'error' listener,
+   * which would turn a handled failure into an uncaught exception. To avoid that
+   * WITHOUT swallowing the failure, emit 'error' only when a listener exists; always
+   * emit 'serviceError' so observers without an 'error' listener can still react.
+   */
+  private emitError(context: string, error: Error): void {
+    this.logError(context, error);
+    if (this.listenerCount('error') > 0) {
+      this.emit('error', error);
+    }
+    this.emit('serviceError', { context, error });
   }
 
   /**

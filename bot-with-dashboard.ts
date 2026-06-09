@@ -9,7 +9,9 @@
  */
 
 import 'dotenv/config';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { ethers } from 'ethers';
+import { ConnectionStatus } from '@polymarket/real-time-data-client';
 import {
   PolymarketSDK,
   ArbitrageService,
@@ -17,10 +19,13 @@ import {
   type SmartMoneyTrade,
   OnchainService,
 } from './src/index.js';
+import { getPolygonProvider, POLYGON_RPC_URL } from './src/utils/provider.js';
+import { fetchWithTimeout } from './src/utils/fetch-timeout.js';
 import { CTFClient } from './src/clients/ctf-client.js';
 import { startDashboard, dashboardEmitter } from './src/dashboard/index.js';
 import type { BotState, BotConfig, LogLevel, DipArbSignal, SmartMoneySignal } from './src/dashboard/types.js';
 import { addSession, createSessionFromState, type TradeRecord } from './src/dashboard/session-history.js';
+import { PaperPortfolio } from './paper-trading.js';
 
 // ============================================================================
 // CONFIGURATION (same as bot-config.ts)
@@ -62,14 +67,14 @@ let CONFIG = {
 
   smartMoney: {
     enabled: process.env.SMARTMONEY_ENABLED !== 'false',
-    topN: 20,
-    // 🔴 FIXED: Stricter criteria (v3.1)
-    minWinRate: 0.60,  // Up from 0.70 to match bot-config (60%+)
-    minPnl: 500,       // Up from 70 to $500
-    minTrades: 30,     // Up from 15 to 30
+    topN: parseInt(process.env.SM_TOPN || '40', 10), // scan topN*2 leaderboard candidates
+    // LOOSENED for volume (still realized-PnL based, not open-position bias). Env-overridable.
+    minWinRate: parseFloat(process.env.SM_MIN_WINRATE || '0.52'),   // was 0.60 — admit more wallets
+    minPnl: parseFloat(process.env.SM_MIN_PNL || '100'),            // was 500 — realized $ floor
+    minTrades: parseInt(process.env.SM_MIN_CLOSED || '15', 10),     // was 30 — min CLOSED trades to vet
 
-    // 🔴 NEW: Quality filters
-    minProfitFactor: 1.5,  // Total wins / total losses >= 1.5x
+    // Quality filters
+    minProfitFactor: parseFloat(process.env.SM_MIN_PF || '1.1'),    // was 1.5 — looser edge bar
     minConsistencyScore: 0.7,  // Recent performance score
     maxSingleTradeExposure: 0.3,  // Max 30% of PnL from one trade
     checkLastNTrades: 10,  // Analyze last 10 trades
@@ -78,7 +83,7 @@ let CONFIG = {
     maxSizePerTrade: 15,  // Up from 10
     maxSlippage: 0.03,
     minTradeSize: 10,  // Up from 5
-    delay: 500,
+    delay: 0,  // Q9: no artificial copy delay (only worsens adverse selection)
     customWallets: [
       '0xc2e7800b5af46e6093872b177b7a5e7f0563be51',
       '0x58c3f5d66c95d4c41b093fbdd2520e46b6c9de74',
@@ -205,7 +210,130 @@ const state: BotState = {
   },
 
   smartMoneySignals: [],
+  wsConnected: false,
 };
+
+// ============================================================================
+// RISK-STATE PERSISTENCE (crash-recovery)
+// ============================================================================
+//
+// The risk gate (daily/monthly/total loss, drawdown, consecutive losses,
+// permanent halt, pause) lives in-memory. Without persistence a bot that
+// permanently halted (or is mid-cooldown) would REARM on restart and resume
+// trading — defeating the whole point of the loss limits. We persist the risk
+// state to JSON on every recordTrade and on shutdown, and LOAD it on boot.
+//
+// NO FALLBACK: if the state file exists but is corrupt/unreadable we log ERROR
+// and refuse to start. Silently resetting to zeros would re-arm a halted bot,
+// which is exactly the forbidden behaviour.
+
+const RISK_STATE_PATH = `${process.env.HOME || '.'}/risk-state.json`;
+
+interface PersistedRiskState {
+  dailyPnL: number;
+  monthlyPnL: number;
+  totalPnL: number;
+  peakCapital: number;
+  currentCapital: number;
+  currentDrawdown: number;
+  consecutiveLosses: number;
+  consecutiveWins: number;
+  tradesExecuted: number;
+  isPaused: boolean;
+  pauseUntil: number;
+  permanentlyHalted: boolean;
+  lastDailyReset: number;
+  monthStartTime: number;
+  smartMoneyTrades: number;
+  arbTrades: number;
+  dipArbTrades: number;
+  directTrades: number;
+  arbProfit: number;
+  savedAt: number;
+}
+
+function saveRiskState(): void {
+  const data: PersistedRiskState = {
+    dailyPnL: state.dailyPnL,
+    monthlyPnL: state.monthlyPnL,
+    totalPnL: state.totalPnL,
+    peakCapital: state.peakCapital,
+    currentCapital: state.currentCapital,
+    currentDrawdown: state.currentDrawdown,
+    consecutiveLosses: state.consecutiveLosses,
+    consecutiveWins: state.consecutiveWins,
+    tradesExecuted: state.tradesExecuted,
+    isPaused: state.isPaused,
+    pauseUntil: state.pauseUntil,
+    permanentlyHalted: state.permanentlyHalted,
+    lastDailyReset: state.lastDailyReset,
+    monthStartTime: state.monthStartTime,
+    smartMoneyTrades: state.smartMoneyTrades,
+    arbTrades: state.arbTrades,
+    dipArbTrades: state.dipArbTrades,
+    directTrades: state.directTrades,
+    arbProfit: state.arbProfit,
+    savedAt: Date.now(),
+  };
+  // Write failures must NOT be swallowed: surface them so a full disk / bad path
+  // is visible rather than silently dropping the risk ledger.
+  writeFileSync(RISK_STATE_PATH, JSON.stringify(data, null, 2));
+}
+
+/**
+ * Load persisted risk state on boot. Throws on a corrupt/unreadable file so the
+ * caller (main) refuses to start instead of re-arming a halted bot with zeros.
+ */
+function loadRiskState(): void {
+  if (!existsSync(RISK_STATE_PATH)) {
+    log('INFO', 'No prior risk-state file — starting with a fresh risk ledger.');
+    return;
+  }
+  let parsed: PersistedRiskState;
+  try {
+    parsed = JSON.parse(readFileSync(RISK_STATE_PATH, 'utf8')) as PersistedRiskState;
+  } catch (err) {
+    // NO FALLBACK: do not reset to zeros — that would re-arm a halted bot.
+    throw new Error(
+      `Risk-state file ${RISK_STATE_PATH} is corrupt/unreadable: ${(err as Error).message}. ` +
+      `Refusing to start. Fix or delete the file manually after review.`
+    );
+  }
+  if (typeof parsed.totalPnL !== 'number' || typeof parsed.permanentlyHalted !== 'boolean') {
+    throw new Error(
+      `Risk-state file ${RISK_STATE_PATH} is missing required fields (totalPnL/permanentlyHalted). ` +
+      `Refusing to start to avoid re-arming a halted bot.`
+    );
+  }
+  state.dailyPnL = parsed.dailyPnL;
+  state.monthlyPnL = parsed.monthlyPnL;
+  state.totalPnL = parsed.totalPnL;
+  state.peakCapital = parsed.peakCapital;
+  state.currentCapital = parsed.currentCapital;
+  state.currentDrawdown = parsed.currentDrawdown;
+  state.consecutiveLosses = parsed.consecutiveLosses;
+  state.consecutiveWins = parsed.consecutiveWins;
+  state.tradesExecuted = parsed.tradesExecuted;
+  state.isPaused = parsed.isPaused;
+  state.pauseUntil = parsed.pauseUntil;
+  state.permanentlyHalted = parsed.permanentlyHalted;
+  state.lastDailyReset = parsed.lastDailyReset;
+  state.monthStartTime = parsed.monthStartTime;
+  state.smartMoneyTrades = parsed.smartMoneyTrades;
+  state.arbTrades = parsed.arbTrades;
+  state.dipArbTrades = parsed.dipArbTrades;
+  state.directTrades = parsed.directTrades;
+  state.arbProfit = parsed.arbProfit;
+  log('INFO', `Restored risk ledger from ${RISK_STATE_PATH}`, {
+    totalPnL: state.totalPnL,
+    permanentlyHalted: state.permanentlyHalted,
+    isPaused: state.isPaused,
+    consecutiveLosses: state.consecutiveLosses,
+  });
+  if (state.permanentlyHalted) {
+    log('ERROR', '🛑 Restored a PERMANENTLY HALTED risk state — trading stays disabled until the file is cleared.');
+  }
+}
 
 // ============================================================================
 // DASHBOARD-AWARE UTILITIES
@@ -309,17 +437,34 @@ function canTrade(): boolean {
     return false;
   }
 
+  // Layer 5 (Q3): consecutive-loss circuit breaker.
+  if (state.consecutiveLosses >= CONFIG.risk.maxConsecutiveLosses) {
+    state.isPaused = true;
+    state.pauseUntil = Date.now() + CONFIG.risk.pauseOnBreachMinutes * 60 * 1000;
+    log('WARN', `🛑 Consecutive-loss breaker: ${state.consecutiveLosses} losses ≥ ${CONFIG.risk.maxConsecutiveLosses} — pausing ${CONFIG.risk.pauseOnBreachMinutes}m`);
+    updateDashboard();
+    return false;
+  }
+
   return true;
 }
 
-// 🔴 FIXED: Enhanced trade recording with win tracking
-function recordTrade(profit: number, strategy: string) {
-  state.tradesExecuted++;
+// In-session realized-trade ledger, fed to createSessionFromState on shutdown.
+const sessionTrades: TradeRecord[] = [];
+
+/**
+ * Apply a REAL realized PnL delta to the risk ledger (daily/monthly/total/peak/
+ * drawdown/streak) and persist it. This is the SINGLE source of truth that
+ * canTrade() reads from. It does NOT touch the per-strategy trade counters —
+ * those are counted when an order/signal fires. `profit` must NEVER be 0/estimate
+ * for a realized event (C3); a genuine break-even close is a legitimate 0.
+ */
+function applyRealizedPnL(profit: number): void {
   state.dailyPnL += profit;
-  state.monthlyPnL += profit;  // NEW
+  state.monthlyPnL += profit;
   state.totalPnL += profit;
 
-  // Track consecutive wins/losses
+  // Track consecutive wins/losses (a strictly-negative close is a loss).
   if (profit < 0) {
     state.consecutiveLosses++;
     state.consecutiveWins = 0;
@@ -328,26 +473,127 @@ function recordTrade(profit: number, strategy: string) {
     state.consecutiveWins++;
   }
 
+  // Persist on every realized change so a crash mid-session never loses the loss
+  // accounting that drives canTrade() / the permanent halt.
+  saveRiskState();
+  updateDashboard();
+}
+
+// 🔴 FIXED: Enhanced trade recording with win tracking.
+// `profit` MUST be a REAL realized number — never an estimate (C3). `detail`
+// carries the market/side/price/wallet for the session summary when known.
+// Used by the LIVE realized-close path and by strategy executions that report a
+// real realized number (arb fills, dipArb round completion).
+function recordTrade(
+  profit: number,
+  strategy: string,
+  detail?: { market?: string; side?: 'BUY' | 'SELL'; size?: number; price?: number; wallet?: string; txHash?: string }
+) {
+  state.tradesExecuted++;
+
   if (strategy === 'smartMoney') state.smartMoneyTrades++;
   else if (strategy === 'arbitrage') state.arbTrades++;
   else if (strategy === 'dipArb') state.dipArbTrades++;
   else if (strategy === 'direct') state.directTrades++;
 
-  updateDashboard();
+  // Append to the session ledger (only strategies the summary type knows about).
+  if (strategy === 'smartMoney' || strategy === 'arbitrage' || strategy === 'dipArb' || strategy === 'direct') {
+    sessionTrades.push({
+      id: `tr-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+      timestamp: new Date().toISOString(),
+      strategy,
+      market: detail?.market ?? 'unknown',
+      side: detail?.side ?? 'BUY',
+      size: detail?.size ?? 0,
+      price: detail?.price ?? 0,
+      profit,
+      wallet: detail?.wallet,
+      txHash: detail?.txHash,
+    });
+    if (sessionTrades.length > 5000) sessionTrades.splice(0, sessionTrades.length - 5000);
+  }
+
+  // Feed the real realized PnL into the risk ledger (persists + dashboards).
+  applyRealizedPnL(profit);
 }
 
-function simulateTrade(profit: number, strategy: string, description: string) {
-  if (!CONFIG.dryRun || !state.paper) return;
+// Last cumulative realized PnL we mirrored from the PaperPortfolio into the risk
+// ledger, so we only ever record the NEW realized delta (never double-count).
+let lastPaperRealized = 0;
 
-  state.paper.trades++;
-  state.paper.pnl += profit;
-  state.paper.balance += profit;
+/**
+ * In DRY-RUN, the "real" PnL is the PaperPortfolio's REALIZED PnL (from sold /
+ * resolved positions). C3 requires canTrade()'s daily/monthly/drawdown/total
+ * limits to derive from real PnL — so we mirror each newly-realized delta into
+ * the risk ledger via recordTrade. Unrealized mark-to-market is NOT recorded
+ * (it isn't realized). Called after every resolver pass and paper close.
+ */
+function syncRiskFromPaper(): void {
+  if (!CONFIG.dryRun || !paper) return;
+  const realizedNow = paper.realizedPnL;
+  const delta = realizedNow - lastPaperRealized;
+  if (Math.abs(delta) < 1e-9) return;
+  lastPaperRealized = realizedNow;
+  // Mirror the realized DELTA (a REAL number) into the risk ledger. We do NOT
+  // bump the trade counters here — copies are already counted per signal — we
+  // only fold the realized PnL so canTrade()'s limits track the paper truth.
+  applyRealizedPnL(delta);
+  log('INFO', `[RISK] Synced paper realized Δ$${delta.toFixed(2)} → totalPnL $${state.totalPnL.toFixed(2)}`);
+}
 
-  // Log as a special SIMULATION event
-  log('TRADE', `[SIMULATION] ${description} | Est. Profit: $${profit.toFixed(2)}`);
+/**
+ * Position size in USDC for a copy/live order, applying the bot's REAL caps:
+ *   - base = capital * maxPerTradePct
+ *   - dynamic sizing (v3.1): shrink after losses, grow after wins, clamped to
+ *     [minPositionPct, maxPositionPct] of capital
+ *   - floored to minOrderUsd
+ *   - clamped so total exposure never exceeds maxTotalExposurePct (30%)
+ *
+ * `currentExposureUsd` is the USDC already deployed in open positions. Returns 0
+ * when no compliant size fits under the exposure cap (caller must then skip).
+ */
+function calculatePositionSize(currentExposureUsd: number): number {
+  const capital = CONFIG.capital.totalUsd;
 
-  // Update main PnL so the user sees movement on the dashboard (as requested)
-  recordTrade(profit, strategy);
+  // Base sizing as a fraction of capital.
+  let pct = CONFIG.capital.maxPerTradePct;
+
+  // Dynamic sizing: adjust by streak, then clamp to the configured band.
+  if (CONFIG.risk.enableDynamicSizing) {
+    if (state.consecutiveLosses > 0) {
+      pct *= Math.pow(1 - CONFIG.risk.lossSizingReduction, state.consecutiveLosses);
+    } else if (state.consecutiveWins > 0) {
+      pct *= Math.pow(1 + CONFIG.risk.winSizingIncrease, state.consecutiveWins);
+    }
+    pct = Math.min(Math.max(pct, CONFIG.risk.minPositionPct), CONFIG.risk.maxPositionPct);
+  }
+
+  let size = capital * pct;
+
+  // 30% total-exposure cap: never deploy past it.
+  const exposureCap = capital * CONFIG.capital.maxTotalExposurePct;
+  const room = exposureCap - currentExposureUsd;
+  if (room <= 0) return 0;
+  size = Math.min(size, room);
+
+  // Floor to the venue minimum; if even the minimum won't fit under the cap, skip.
+  if (size < CONFIG.capital.minOrderUsd) return 0;
+  return size;
+}
+
+/**
+ * Current USDC exposure across the bot's open positions (live mode). Used to
+ * enforce the 30% total-exposure cap before sizing a new live order. In dry-run
+ * the PaperPortfolio enforces its own exposure cap, so this is live-only.
+ */
+function currentLiveExposureUsd(): number {
+  let sum = 0;
+  for (const p of state.positions) {
+    const size = Number((p as any).size) || 0;
+    const price = Number((p as any).curPrice) || Number((p as any).avgPrice) || 0;
+    if (size > 0 && price > 0) sum += size * price;
+  }
+  return sum;
 }
 
 // ============================================================================
@@ -355,14 +601,58 @@ function simulateTrade(profit: number, strategy: string, description: string) {
 // STRATEGIES (simplified versions - copy full implementations from bot-config.ts)
 // ============================================================================
 
+let paper: PaperPortfolio | null = null;
 let arbService: ArbitrageService | null = null;
 let isSmartMoneyInitialized = false;
 let isSmartMoneyInitializing = false;
+// Watchdog state: the smart-money WebSocket subscription can silently die on a
+// reconnect (Polymarket's `leger AddSubscriptions ... connection_id_fk` race —
+// the replay fires before the new connection is registered server-side). We
+// track the last real copy signal and re-establish the feed when it goes silent.
+let smSubscription: { unsubscribe: () => void } | null = null;
+let lastSignalAt = Date.now();
+let smWatchdogStarted = false;
+
+// Every long-lived interval registers here so the unified shutdown() can clear
+// them all (otherwise a SIGTERM/crash leaves pollers firing during teardown).
+const timers: NodeJS.Timeout[] = [];
+function track(t: NodeJS.Timeout): NodeJS.Timeout { timers.push(t); return t; }
 
 async function setupSmartMoney(sdk: PolymarketSDK) {
   if (CONFIG.smartMoney.enabled) {
     initializeSmartMoney(sdk);
+    startSmartMoneyWatchdog(sdk);
   }
+}
+
+/**
+ * Self-heals the smart-money feed. Polymarket's realtime WS drops periodically;
+ * on reconnect the subscription replay can fail server-side (connection_id_fk
+ * race), leaving the bot "connected" but receiving ZERO copy signals — which
+ * silently invalidates a multi-day run. If no copy signal has arrived for
+ * SM_SILENCE_MIN minutes while smart-money is enabled, we re-qualify and
+ * re-subscribe on a fresh connection. (Also doubles as periodic re-qualification,
+ * which the wallet set otherwise never got after boot.)
+ */
+function startSmartMoneyWatchdog(sdk: PolymarketSDK) {
+  if (smWatchdogStarted) return;
+  smWatchdogStarted = true;
+  const SILENCE_MS = (parseFloat(process.env.SM_SILENCE_MIN || '12')) * 60 * 1000;
+  const CHECK_MS = 3 * 60 * 1000;
+  track(setInterval(async () => {
+    if (!CONFIG.smartMoney.enabled) return;
+    if (isSmartMoneyInitializing) return; // a (re)init is already in flight
+    const silentMs = Date.now() - lastSignalAt;
+    if (silentMs < SILENCE_MS) return;
+    log('WARN', `🐶 Smart-money feed silent ${Math.round(silentMs / 60000)}m (0 copy signals) — re-establishing subscription on a fresh connection (WS resubscribe self-heal).`);
+    isSmartMoneyInitialized = false;       // allow initializeSmartMoney to re-run
+    lastSignalAt = Date.now();             // avoid re-trigger while re-init runs
+    try {
+      await initializeSmartMoney(sdk);
+    } catch (err) {
+      log('ERROR', `Smart-money watchdog re-init failed: ${(err as Error).message}`);
+    }
+  }, CHECK_MS));
 }
 
 async function initializeSmartMoney(sdk: PolymarketSDK) {
@@ -387,27 +677,38 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
       // Check if disabled mid-process to abort early
       if (!CONFIG.smartMoney.enabled && qualified.length === 0) break;
 
-      if (qualified.length >= 10) break; // User limit: Max 10 qualified wallets
+      if (qualified.length >= parseInt(process.env.SM_MAX_FOLLOWED || '25', 10)) break; // more wallets = more copy volume
       if (qualified.includes(entry.address)) continue;
 
-      const profile = await sdk.wallets.getWalletProfile(entry.address);
-      if (!profile) continue;
+      // C5/S1: qualify on REALIZED/closed history, NOT unrealized open positions.
+      // The old path (getWalletProfile.winRate) scored open positions → survivorship
+      // bias (a wallet that closed 50 losers but holds 5 green opens read ~100%).
+      let stats;
+      try {
+        stats = await sdk.wallets.getRealizedStats(entry.address, CONFIG.smartMoney.minTrades);
+      } catch (err) {
+        // No-fallback: surface loudly and EXCLUDE. We never fabricate stats or
+        // copy a wallet we could not vet.
+        log('ERROR', `Realized-stats fetch failed for ${entry.address.slice(0, 10)}…: ${(err as Error).message}`);
+        continue;
+      }
 
-      const winRate = (profile as any).winRate ?? 0;
-      const pnl = entry.pnl ?? 0;
-      const trades = profile.tradeCount ?? 0;
+      // Not enough CLOSED trades to evaluate → skip (defer, NOT a fabricated fail).
+      if (stats.insufficientHistory) continue;
 
-      if (winRate >= CONFIG.smartMoney.minWinRate &&
-        pnl >= CONFIG.smartMoney.minPnl &&
-        trades >= CONFIG.smartMoney.minTrades) {
+      if (stats.winRate >= CONFIG.smartMoney.minWinRate &&
+        stats.realizedPnL >= CONFIG.smartMoney.minPnl &&
+        stats.profitFactor >= CONFIG.smartMoney.minProfitFactor) {
         qualified.push(entry.address);
-        log('WALLET', `✅ Qualified: ${entry.address.slice(0, 10)}... (WR:${(winRate * 100).toFixed(0)}% PnL:$${pnl.toFixed(0)} T:${trades})`);
+        const pf = stats.profitFactor === Infinity ? '∞' : stats.profitFactor.toFixed(2);
+        log('WALLET', `✅ Qualified: ${entry.address.slice(0, 10)}… (realized WR:${(stats.winRate * 100).toFixed(0)}% PF:${pf} rPnL:$${stats.realizedPnL.toFixed(0)} closed:${stats.closedTrades})`);
       }
 
       await new Promise(r => setTimeout(r, 300));
     }
   } catch (err) {
-    log('WARN', `Leaderboard error: ${(err as Error).message}`);
+    // No-fallback: do not silently proceed on a partial/failed qualification.
+    log('ERROR', `Leaderboard qualification error: ${(err as Error).message}`);
   }
 
   state.followedWallets = qualified;
@@ -415,14 +716,36 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
   updateDashboard();
 
   if (qualified.length > 0) {
-    // Subscribe to smart money trades with address filter
-    sdk.smartMoney.subscribeSmartMoneyTrades(
+    // Drop any prior subscription before re-subscribing — the watchdog re-runs
+    // this function to self-heal a dead feed, and we must not stack subscriptions.
+    if (smSubscription) {
+      try { smSubscription.unsubscribe(); } catch (e) { log('WARN', `prior smart-money unsubscribe failed: ${(e as Error).message}`); }
+      smSubscription = null;
+    }
+    // Q5: hand the followed set to the subscription as `filterAddresses` so the
+    // service itself only delivers trades from wallets we copy. The callback
+    // re-checks below as defence-in-depth, but the filter is the primary gate.
+    smSubscription = sdk.smartMoney.subscribeSmartMoneyTrades(
       async (trade: SmartMoneyTrade) => {
-        if (!CONFIG.smartMoney.enabled) return;
-        if (!canTrade()) return;
+        // --- SINGLE RISK-GATED ROUTE (C2) -----------------------------------
+        // ONE path only. No branch may bypass the followed filter, canTrade(),
+        // or the position caps.
 
-        // ... (inside setupSmartMoney callback)
-        // Add to smart money signals for dashboard
+        if (!CONFIG.smartMoney.enabled) return;
+
+        // C2/Q5: followed-wallet filter FIRST. We only ever act on qualified
+        // smart-money wallets — never the whole market.
+        const followed = state.followedWallets.some(
+          w => w.toLowerCase() === trade.traderAddress.toLowerCase()
+        );
+        if (!followed) return;
+
+        // A real followed-wallet trade arrived → the feed is alive. The watchdog
+        // reads this to detect a dead subscription (WS resubscribe race) and heal.
+        lastSignalAt = Date.now();
+
+        // Dashboard signal feed (after the followed filter, so the feed reflects
+        // only wallets we actually copy).
         const signal: SmartMoneySignal = {
           id: `sm-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
           timestamp: new Date().toISOString(),
@@ -436,7 +759,6 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
         if (state.smartMoneySignals.length > 50) {
           state.smartMoneySignals = state.smartMoneySignals.slice(0, 50);
         }
-
         log('SIGNAL', `Copy trade signal from ${trade.traderAddress.slice(0, 10)}...`, {
           market: trade.marketSlug?.slice(0, 50),
           side: trade.side,
@@ -445,19 +767,183 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
         });
         updateDashboard();
 
-        // EXECUTION LOGIC
+        // C2: risk gate. Daily/monthly/drawdown/total-loss + pause + permanent
+        // halt all live here. If we can't trade, we stop — no path around it.
+        if (!canTrade()) return;
+
+        const label = `${trade.marketSlug || 'mkt'}${trade.outcome ? ':' + trade.outcome : ''}`;
+
         if (CONFIG.dryRun) {
-          // ... execution
-          simulateTrade(0, 'smartMoney', `Smart Money Copy: ${trade.side} ${trade.size} shares @ ${trade.price}`);
-        } else {
-          // ... live execution
-          // simplified placeholder from original file
-          // ...
+          // DRY-RUN execution → isolated PaperPortfolio. PnL is recorded at
+          // SETTLEMENT by runPaperResolver (resolution) / onSignal SELL (close),
+          // NOT here — we never pass a fabricated profit (C3). The PaperPortfolio
+          // enforces its own per-trade + 30% exposure caps that mirror CONFIG.
+          if (!paper) return;
+          state.smartMoneyTrades++;
+          const action = paper.onSignal({
+            market: trade.tokenId || trade.marketSlug || 'unknown', // tokenId = precise outcome key
+            conditionId: trade.conditionId,
+            outcome: trade.outcome,
+            slug: trade.marketSlug,
+            side: trade.side as 'BUY' | 'SELL',
+            price: trade.price,
+            size: trade.size,
+            wallet: trade.traderAddress,
+          });
+          const s = paper.snapshot();
+          log('TRADE', `[PAPER] ${trade.side} ${label.slice(0, 40)} @ ${trade.price} → ${action} | Equity $${s.equity.toFixed(2)} (${s.totalPnLPct >= 0 ? '+' : ''}${s.totalPnLPct.toFixed(2)}%)`);
+          // A SELL that closes a held position realizes PnL immediately — fold the
+          // realized delta into the risk ledger now (BUYs realize nothing yet).
+          syncRiskFromPaper();
+          updateDashboard();
+          return;
         }
-      });
+
+        // --- LIVE execution (DORMANT until DRY_RUN is validated) ------------
+        // Strictly gated behind !CONFIG.dryRun (we are here only because the
+        // dry-run branch above returned). Real, complete copy execution using
+        // EXISTING SDK primitives (sdk.tradingService.createMarketOrder). PnL is
+        // NOT recorded here for opening BUYs — those are entries; realized PnL is
+        // booked when the position closes (the SELL branch below realizes it).
+        // A closing SELL of a position we hold books realized PnL immediately.
+        await executeLiveCopy(sdk, trade, label);
+      },
+      { filterAddresses: qualified, minSize: CONFIG.smartMoney.minTradeSize }
+    );
+    lastSignalAt = Date.now(); // reset the silence timer on (re)subscribe
   }
   isSmartMoneyInitialized = true;
   isSmartMoneyInitializing = false;
+}
+
+// In-flight guard: never fire two concurrent live copies for the same token (a
+// fast leader can emit multiple fills on one token within a tick).
+const liveCopyInFlight = new Set<string>();
+
+/**
+ * REAL live copy execution (C1) — dormant until DRY_RUN is validated.
+ *
+ * Sizes via the bot's caps (calculatePositionSize + 30% exposure), validates the
+ * live mid hasn't drifted from the leader's price, then places a CLOB market
+ * order via the existing TradingService. NO FALLBACK: a failed order is logged
+ * ERROR and surfaced; we never fabricate a fill or a profit.
+ *
+ * PnL discipline (C3): an opening BUY is an entry — no profit is recorded until
+ * the position settles (booked from real positions at resolution). A SELL that
+ * closes a position we hold realizes PnL against its average entry and is
+ * recorded immediately with the REAL number.
+ */
+async function executeLiveCopy(sdk: PolymarketSDK, trade: SmartMoneyTrade, label: string): Promise<void> {
+  const tokenId = trade.tokenId;
+  if (!tokenId) {
+    log('WARN', `Live copy skipped: signal has no tokenId (${label.slice(0, 40)})`);
+    return;
+  }
+
+  if (liveCopyInFlight.has(tokenId)) {
+    log('INFO', `Live copy skipped: order already in flight for ${tokenId.slice(0, 12)}…`);
+    return;
+  }
+  liveCopyInFlight.add(tokenId);
+  try {
+    // Drift guard: refuse to chase a moved market. Read the live midpoint and
+    // abort if it diverged from the leader's executed price beyond the cap.
+    const COPY_MAX_DRIFT = parseFloat(process.env.LIVE_COPY_MAX_DRIFT || '0.03');
+    const liveMid = await sdk.markets.getMidpoint(tokenId);
+    if (!Number.isFinite(liveMid)) {
+      log('ERROR', `Live copy aborted: live midpoint for ${tokenId} is not finite (${liveMid})`);
+      return;
+    }
+    const drift = Math.abs(liveMid - trade.price);
+    if (drift > COPY_MAX_DRIFT) {
+      log('WARN', `Live copy aborted: mid ${liveMid.toFixed(4)} drifted ${drift.toFixed(4)} from leader ${trade.price.toFixed(4)} (max ${COPY_MAX_DRIFT}) on ${label.slice(0, 40)}`);
+      return;
+    }
+
+    const maxSlippage = CONFIG.smartMoney.maxSlippage;
+
+    if (trade.side === 'BUY') {
+      // Size via the bot's caps (per-trade % + dynamic sizing + 30% exposure).
+      let amountUsd = calculatePositionSize(currentLiveExposureUsd());
+      if (amountUsd <= 0) {
+        log('WARN', `Live copy skipped: exposure cap reached (no room under ${(CONFIG.capital.maxTotalExposurePct * 100).toFixed(0)}%) for ${label.slice(0, 40)}`);
+        return;
+      }
+      // Respect the strategy's per-trade ceiling too.
+      amountUsd = Math.min(amountUsd, CONFIG.smartMoney.maxSizePerTrade);
+      if (amountUsd < CONFIG.capital.minOrderUsd) {
+        log('WARN', `Live copy skipped: sized $${amountUsd.toFixed(2)} below min order $${CONFIG.capital.minOrderUsd}`);
+        return;
+      }
+
+      const limitPrice = Math.min(0.999, trade.price * (1 + maxSlippage));
+      // BUY market order: `amount` is USDC notional to spend.
+      const res = await sdk.tradingService.createMarketOrder({
+        tokenId,
+        side: 'BUY',
+        amount: amountUsd,
+        price: limitPrice,
+        orderType: 'FOK',
+      });
+
+      if (res.success) {
+        state.smartMoneyTrades++;
+        log('TRADE', `✅ [LIVE] BUY $${amountUsd.toFixed(2)} ${label.slice(0, 40)} @ ~${trade.price.toFixed(3)} (order ${res.orderId ?? 'n/a'})`);
+        // C3: an opening BUY books NO profit. Realized PnL is recorded when this
+        // position later closes (a followed-wallet SELL hits the branch below).
+        updateDashboard();
+      } else {
+        log('ERROR', `❌ [LIVE] BUY failed for ${label.slice(0, 40)}: ${res.errorMsg ?? 'unknown error'}`);
+      }
+    } else {
+      // SELL — only meaningful if we actually hold the token. `amount` is SHARES.
+      const held = state.positions.find(p => (p as any).asset === tokenId);
+      const heldShares = held ? Number((held as any).size) || 0 : 0;
+      if (heldShares <= 0) {
+        log('INFO', `Live copy SELL ignored: no open position in ${tokenId.slice(0, 12)}… to close`);
+        return;
+      }
+      const limitPrice = Math.max(0.001, trade.price * (1 - maxSlippage));
+      const res = await sdk.tradingService.createMarketOrder({
+        tokenId,
+        side: 'SELL',
+        amount: heldShares,
+        price: limitPrice,
+        orderType: 'FOK',
+      });
+
+      if (res.success) {
+        // C3: closing SELL realizes PnL against the REAL average entry.
+        // recordTrade() increments state.smartMoneyTrades — do NOT double-count.
+        const entry = Number((held as any).avgPrice) || 0;
+        // Use the ACTUAL fill price from the order, never the leader's price. If the
+        // CLOB response didn't expose it, fall back to the contractual limit (worst
+        // case for us), which can only UNDER-state our gain — never inflate it.
+        const filledShares = (res.filledSize && res.filledSize > 0) ? res.filledSize : heldShares;
+        const exit = (res.avgPrice && res.avgPrice > 0) ? res.avgPrice : limitPrice;
+        if (res.avgPrice === undefined) {
+          log('WARN', `[LIVE] SELL fill price not reported by CLOB — using limit $${limitPrice.toFixed(3)} (conservative). Reconcile from on-chain fill before trusting realized PnL.`);
+        }
+        const realized = (exit - entry) * filledShares;
+        log('TRADE', `✅ [LIVE] SELL ${filledShares.toFixed(2)} ${label.slice(0, 40)} @ ~${exit.toFixed(3)} | realized $${realized.toFixed(2)} (order ${res.orderId ?? 'n/a'})`);
+        recordTrade(realized, 'smartMoney', {
+          market: trade.marketSlug || tokenId,
+          side: 'SELL',
+          size: filledShares,
+          price: exit,
+          wallet: trade.traderAddress,
+          txHash: res.transactionHashes?.[0],
+        });
+      } else {
+        log('ERROR', `❌ [LIVE] SELL failed for ${label.slice(0, 40)}: ${res.errorMsg ?? 'unknown error'}`);
+      }
+    }
+  } catch (err) {
+    // NO FALLBACK: surface the failure, never fabricate a result.
+    log('ERROR', `Live copy execution error for ${label.slice(0, 40)}: ${(err as Error).message}`);
+  } finally {
+    liveCopyInFlight.delete(tokenId);
+  }
 }
 
 
@@ -491,22 +977,21 @@ async function setupArbitrage(_sdk: PolymarketSDK) {
     };
     log('ARB', `Opportunity: ${opp.type.toUpperCase()} +${opp.profitPercent.toFixed(2)}%`);
 
-    // SIMULATION HOOK
-    if (CONFIG.dryRun && opp.profitPercent > 0) {
-      // Conservative estimate: 10% of max size or min size
-      const size = Math.max(CONFIG.arbitrage.minTradeSize, 10);
-      const estimatedProfit = size * (opp.profitPercent / 100);
-      simulateTrade(estimatedProfit, 'arbitrage', `Arb ${opp.market}`);
-    }
+    // C4: an 'opportunity' is NOT a trade. It re-fires on every orderbook tick,
+    // so crediting an estimated profit here poisoned totalPnL / peakCapital with
+    // phantom gains. We only credit arb PnL from the 'execution' handler below
+    // with the REAL realized profit. No simulateTrade / recordTrade here.
 
     updateDashboard();
   });
 
   arbService.on('execution', (result) => {
     if (result.success) {
-      state.arbProfit += result.profit || 0;
-      recordTrade(result.profit || 0, 'arbitrage');
-      log('TRADE', `Arb trade executed: +$${(result.profit || 0).toFixed(2)} profit`);
+      // C4: this is the ONLY place arb PnL is credited — from the real fill.
+      const profit = result.profit || 0;
+      state.arbProfit += profit;
+      recordTrade(profit, 'arbitrage', { market: state.activeArbMarket || 'arb', price: 0, size: 0 });
+      log('TRADE', `Arb trade executed: +$${profit.toFixed(2)} profit`);
     }
   });
 
@@ -616,6 +1101,9 @@ async function setupDipArb(sdk: PolymarketSDK) {
     updateDashboard();
   });
 
+  // Per-leg execution: LOG ONLY. C3 — a single leg is not a realized result, so
+  // we must NOT record PnL here (recording 0 every leg poisoned the streak and
+  // tradesExecuted). Realized PnL is booked once per round on 'roundComplete'.
   sdk.dipArb.on('execution', (r: any) => {
     if (r.success) {
       const price = r.price ? r.price.toFixed(3) : '??';
@@ -638,10 +1126,34 @@ async function setupDipArb(sdk: PolymarketSDK) {
         default:
           log('TRADE', `DipArb ${r.leg}: ${r.side} @ ${price}`);
       }
-      recordTrade(0, 'dipArb');
     } else {
       log('WARN', `DipArb Execution Failed (${r.leg}): ${r.error || 'Unknown error'}`);
     }
+  });
+
+  // C3: book the REAL realized PnL once per closed round. `profit` is per-share
+  // (1 - actualTotalCost) and `leg1.shares` is the round size, so realized =
+  // profit × shares. Only 'completed' rounds have a locked, real number — we
+  // never fabricate one for 'expired'/'partial' rounds.
+  sdk.dipArb.on('roundComplete', (round: any) => {
+    if (round.status !== 'completed') {
+      log('WARN', `DipArb round ${round.roundId} ended ${round.status} (no realized PnL recorded).`);
+      return;
+    }
+    const perShare = typeof round.profit === 'number' ? round.profit : null;
+    const shares = Number(round.leg1?.shares) || Number(round.leg2?.shares) || 0;
+    if (perShare === null || shares <= 0) {
+      log('ERROR', `DipArb round ${round.roundId} completed but profit/shares missing — refusing to record a fabricated PnL.`);
+      return;
+    }
+    const realized = perShare * shares;
+    log('TRADE', `DipArb round ${round.roundId} realized $${realized.toFixed(2)} (${(perShare * 100).toFixed(2)}%/share × ${shares})`);
+    recordTrade(realized, 'dipArb', {
+      market: state.activeDipArbMarket || 'dipArb',
+      side: 'BUY',
+      size: shares,
+      price: Number(round.leg1?.price) || 0,
+    });
   });
 
   sdk.dipArb.on('rotate', (e: { newMarket: string }) => {
@@ -689,15 +1201,11 @@ let swapService: SwapService | null = null;
 
 async function updateBalances() {
   if (CONFIG.dryRun) {
-    // SIMULATION: Mock balances
-    // Base 10,000 + whatever PnL we've made in this session
-    state.usdcEBalance = 10000 + state.totalPnL;
+    // SIMULATION: the displayed USDC.e balance MUST be the paper engine's real
+    // equity (mark-to-market), NOT a fictional 10k base. Sizing/exposure caps run
+    // on CONFIG.capital.totalUsd; showing 10k made every dashboard $/% incoherent.
+    state.usdcEBalance = paper ? paper.equity() : CONFIG.capital.totalUsd;
     state.maticBalance = 100;
-
-    // Only verify once/log sparsely
-    if (Math.random() < 0.05) { // Occasional log
-      // no-op
-    }
     updateDashboard();
     return;
   }
@@ -739,8 +1247,9 @@ async function setupSwap() {
   try {
     if (!process.env.POLYMARKET_PRIVATE_KEY) return;
 
-    // Create SwapService with signer
-    const provider = new ethers.providers.JsonRpcProvider('https://polygon-rpc.com');
+    // Create SwapService with signer. Use the shared StaticJsonRpcProvider so we
+    // don't trigger the eth_chainId network-detection probe (NETWORK_ERROR spam).
+    const provider = getPolygonProvider();
     const signer = new ethers.Wallet(process.env.POLYMARKET_PRIVATE_KEY, provider);
     swapService = new SwapService(signer);
 
@@ -759,7 +1268,7 @@ async function setupSwap() {
     }
 
     // Poll balances every 30 seconds
-    setInterval(updateBalances, 30000);
+    track(setInterval(updateBalances, 30000));
 
     updateDashboard();
   } catch (err) {
@@ -776,7 +1285,7 @@ async function setupOnchain() {
 
     const onchain = new OnchainService({
       privateKey: process.env.POLYMARKET_PRIVATE_KEY,
-      rpcUrl: 'https://polygon-rpc.com',
+      rpcUrl: POLYGON_RPC_URL,
     });
 
     if (CONFIG.onchain.autoApprove) {
@@ -842,10 +1351,10 @@ async function setupBinanceAnalysis(sdk: PolymarketSDK) {
     updateDashboard();
   }
 
+  // Q8: this was registered TWICE — a duplicate setInterval doubled the Binance
+  // API load and the TREND log spam. One initial run + one interval.
   await updateTrends();
-  setInterval(updateTrends, 5 * 60 * 1000);
-  await updateTrends();
-  setInterval(updateTrends, 5 * 60 * 1000);
+  track(setInterval(updateTrends, 5 * 60 * 1000));
 }
 
 async function setupDirectTrading(sdk: PolymarketSDK) {
@@ -893,27 +1402,53 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
               const price = targetToken.price;
 
               if (CONFIG.dryRun) {
-                // Simulate the trade in DRY RUN mode
-                simulateTrade(0, 'direct', `Trend signal: ${market.question?.slice(0, 40)}... → ${trend.toUpperCase()} (Buy ${targetToken.outcome}) @ ${price.toFixed(2)}`);
-                state.directTrades = (state.directTrades ?? 0) + 1;
-                updateDashboard();
+                // DRY-RUN: route the paper estimate to the isolated PaperPortfolio
+                // (never recordTrade with a fabricated 0). The BUY opens a paper
+                // position that the resolver settles with a REAL price later.
+                if (paper) {
+                  const action = paper.onSignal({
+                    market: targetToken.tokenId,
+                    conditionId: market.conditionId,
+                    outcome: targetToken.outcome,
+                    slug: market.question?.slice(0, 60),
+                    side: 'BUY',
+                    price,
+                    size: Math.max(CONFIG.capital.minOrderUsd, CONFIG.capital.totalUsd * CONFIG.capital.maxPerTradePct) / Math.max(price, 0.001),
+                    wallet: 'direct',
+                  });
+                  state.directTrades = (state.directTrades ?? 0) + 1;
+                  log('TRADE', `[PAPER] DIRECT BUY ${targetToken.outcome} ${market.question?.slice(0, 40)} @ ${price.toFixed(3)} → ${action}`);
+                  updateDashboard();
+                }
               } else {
-                // Live Mode Execution
-                const amountUsdc = 5; // Fixed small size for testing ($5)
+                // LIVE (DORMANT until DRY_RUN validated): size via the bot's caps
+                // (per-trade % + dynamic + 30% exposure), NOT a fixed $5.
+                let amountUsdc = calculatePositionSize(currentLiveExposureUsd());
+                if (amountUsdc <= 0) {
+                  log('WARN', `Direct trade skipped: exposure cap reached for ${market.question?.slice(0, 30)}...`);
+                  continue;
+                }
 
                 log('SIGNAL', `Executing Trend Trade: ${trend.toUpperCase()} on ${market.question?.slice(0, 30)}...`);
 
                 sdk.tradingService.createMarketOrder({
                   tokenId: targetToken.tokenId,
                   side: 'BUY',
-                  amount: amountUsdc
+                  amount: amountUsdc,
+                  price: Math.min(0.999, price * (1 + CONFIG.directTrading.minTrendStrength)),
+                  orderType: 'FOK',
                 }).then(res => {
                   if (res.success) {
-                    log('TRADE', `✅ Direct Trade: Bought $${amountUsdc} of ${targetToken.outcome} @ ~${price.toFixed(2)}`);
-                    recordTrade(0, 'direct');
+                    state.directTrades = (state.directTrades ?? 0) + 1;
+                    // C3: opening BUY is an entry — NO profit booked here. Realized
+                    // PnL is recorded when the position closes/resolves.
+                    log('TRADE', `✅ Direct Trade: Bought $${amountUsdc.toFixed(2)} of ${targetToken.outcome} @ ~${price.toFixed(2)} (order ${res.orderId ?? 'n/a'})`);
+                    updateDashboard();
                   } else {
-                    log('WARN', `❌ Direct Trade failed: ${res.errorMsg}`);
+                    log('ERROR', `❌ Direct Trade failed: ${res.errorMsg ?? 'unknown error'}`);
                   }
+                }).catch((err: unknown) => {
+                  log('ERROR', `❌ Direct Trade error: ${(err as Error).message}`);
                 });
               }
             }
@@ -926,9 +1461,9 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
   }
 
   // Check every 5 minutes
-  setInterval(checkTrendTrades, 5 * 60 * 1000);
+  track(setInterval(checkTrendTrades, 5 * 60 * 1000));
   // Initial check after 10 seconds (let trends stabilize)
-  setTimeout(checkTrendTrades, 10000);
+  track(setTimeout(checkTrendTrades, 10000));
 }
 
 async function setupPortfolioManager(sdk: PolymarketSDK) {
@@ -944,8 +1479,14 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
     log('WARN', `Portfolio Sync failed: ${err.message}`);
   }
 
+  // Re-entrancy guard: an RPC stall must not let a second sync stack on the
+  // first (which would double the API load and race on state.positions).
+  let portfolioSyncRunning = false;
+
   // Periodic Position Sync (Every 30s)
-  setInterval(async () => {
+  track(setInterval(async () => {
+    if (portfolioSyncRunning) return;
+    portfolioSyncRunning = true;
     try {
       const positions = await sdk.wallets.getWalletPositions(sdk.tradingService.getAddress());
 
@@ -1000,8 +1541,107 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
       updateDashboard();
     } catch (err: any) {
       log('WARN', `Portfolio sync error: ${err.message}`);
+    } finally {
+      portfolioSyncRunning = false;
     }
-  }, 30 * 1000);
+  }, 30 * 1000));
+}
+
+// Re-entrancy guard: a slow Gamma API call must not let a second resolver pass
+// stack on top of the first.
+let paperResolverRunning = false;
+
+// Paper-trading resolver: live mark-to-market + settle resolved positions via Gamma API.
+// Per-token streak of consecutive resolver passes the price has been pinned at an
+// extreme. A sustained pin = a decided outcome → settle (bridges Gamma's close lag).
+const pinnedCycles = new Map<string, number>();
+const PIN_CYCLES_TO_SETTLE = parseInt(process.env.PIN_CYCLES || '3', 10);
+
+async function runPaperResolver() {
+  if (!paper) return;
+  if (paperResolverRunning) return;
+  paperResolverRunning = true;
+  try {
+    const open = paper.listOpen();
+    for (const { tokenId, conditionId } of open) {
+      if (!conditionId) continue;
+      try {
+        const r = await fetchWithTimeout(`https://gamma-api.polymarket.com/markets?condition_ids=${conditionId}`);
+        const arr = await r.json();
+        let mk = Array.isArray(arr) ? arr[0] : null;
+        if (!mk) {
+          // A RESOLVED market drops out of Gamma's default (active-only) query, so
+          // the plain fetch returns []. Re-query explicitly for the closed market
+          // so we can SETTLE it. This was the silent gap: once a position's market
+          // resolved it disappeared here and was skipped forever → never realized.
+          const rc = await fetchWithTimeout(`https://gamma-api.polymarket.com/markets?condition_ids=${conditionId}&closed=true`);
+          const arrc = await rc.json();
+          mk = Array.isArray(arrc) ? arrc[0] : null;
+          if (!mk) continue; // genuinely not indexed this cycle; retry next pass
+        }
+        let tokenIds: string[] = [];
+        let prices: string[] = [];
+        try { tokenIds = JSON.parse(mk.clobTokenIds); } catch { /* ignore */ }
+        try { prices = JSON.parse(mk.outcomePrices); } catch { /* ignore */ }
+        const idx = tokenIds.indexOf(tokenId);
+        if (idx < 0) continue;
+        const px = parseFloat(prices[idx]);
+        if (mk.closed) {
+          const clean = prices.length === 2 &&
+            ((prices[0] === '1' && prices[1] === '0') || (prices[0] === '0' && prices[1] === '1'));
+          if (clean) {
+            paper.settle(tokenId, px, 'resolved'); // px is exactly 1 (win) or 0 (loss)
+            log('TRADE', `[PAPER] ⚖️ RESOLVED ${(mk.slug || tokenId).slice(0, 40)} → ${px >= 0.5 ? 'WON $1' : 'LOST $0'}/share`);
+          } else {
+            // NO FALLBACK: a closed-but-not-cleanly-resolved market must NOT be
+            // settled at a fabricated price (0.5 / lastTradePrice). Leave the
+            // position OPEN and log ERROR with the conditionId for manual review.
+            // It will be re-checked next cycle and settled once it resolves to 1/0.
+            log('ERROR', `[PAPER] Market closed but NOT cleanly resolved (1/0) — leaving position OPEN for manual review. condition=${conditionId} token=${tokenId.slice(0, 16)}… slug=${mk.slug || 'n/a'} prices=${JSON.stringify(prices)}`);
+          }
+        } else {
+          // Not formally `closed` in Gamma yet — its flag trails the real event end
+          // by hours (UMA finalization), so decided positions sit unrealized and
+          // jam the exposure cap. Mark to live price, and SETTLE once the price has
+          // been pinned at an extreme (≥0.99 / ≤0.01) for PIN_CYCLES_TO_SETTLE
+          // consecutive resolver passes (~6 min) — a concluded outcome, settled at
+          // its REAL pinned payout (1 or 0), never a fabricated mid.
+          if (px > 0 && px < 1) paper.markPrice(tokenId, px);
+          const pinned = px >= 0.99 || px <= 0.01;
+          if (pinned) {
+            const n = (pinnedCycles.get(tokenId) || 0) + 1;
+            pinnedCycles.set(tokenId, n);
+            if (n >= PIN_CYCLES_TO_SETTLE) {
+              const payout = px >= 0.99 ? 1 : 0;
+              paper.settle(tokenId, payout, 'resolved');
+              pinnedCycles.delete(tokenId);
+              log('TRADE', `[PAPER] ⚖️ SETTLED (price pinned ${px.toFixed(3)} ×${n} cycles) ${(mk.slug || tokenId).slice(0, 36)} → ${payout ? 'WON $1' : 'LOST $0'}/share`);
+            }
+          } else {
+            pinnedCycles.delete(tokenId); // un-pinned → reset the streak
+          }
+        }
+      } catch (err) {
+        // Surface (do not swallow) per-position resolver failures; retried next cycle.
+        log('WARN', `[PAPER] resolver check failed for ${conditionId.slice(0, 18)}…: ${(err as Error).message}`);
+      }
+      await new Promise(res => setTimeout(res, 150)); // gentle on the API
+    }
+    // Purge orphaned pin streaks: a token settled via the `closed` path or closed by
+    // a leader SELL leaves listOpen() and would never be revisited to clear its entry,
+    // so pinnedCycles would grow unbounded. Keep only still-open tokens.
+    const openTokens = new Set(paper.listOpen().map(o => o.tokenId));
+    for (const k of pinnedCycles.keys()) {
+      if (!openTokens.has(k)) pinnedCycles.delete(k);
+    }
+    paper.save();
+    // Fold any newly-realized (resolved/sold) paper PnL into the risk ledger so
+    // canTrade()'s limits track the real dry-run result (C3).
+    syncRiskFromPaper();
+    updateDashboard();
+  } finally {
+    paperResolverRunning = false;
+  }
 }
 
 async function main() {
@@ -1014,9 +1654,21 @@ async function main() {
   startDashboard(3001);
   console.log('\n🌐 Dashboard: http://localhost:3001\n');
 
+  // Crash-recovery: restore the persisted risk ledger BEFORE any trading wiring.
+  // Throws (and aborts startup) on a corrupt file — NO silent reset to zeros.
+  loadRiskState();
+  updateDashboard();
+
+  // Q2: a missing private key is only FATAL for LIVE trading. In dry-run the SDK
+  // falls back to a dummy read-only key internally, so we must NOT process.exit —
+  // gate the hard exit on !CONFIG.dryRun. (We still warn loudly: balance/onchain
+  // setup that needs a real key is already self-skipping when it's absent.)
   if (!process.env.POLYMARKET_PRIVATE_KEY) {
-    log('ERROR', 'POLYMARKET_PRIVATE_KEY not found');
-    process.exit(1);
+    if (!CONFIG.dryRun) {
+      log('ERROR', 'POLYMARKET_PRIVATE_KEY not found — required for LIVE trading. Aborting.');
+      process.exit(1);
+    }
+    log('WARN', 'POLYMARKET_PRIVATE_KEY not set — running DRY-RUN with read-only SDK access (no wallet balances / on-chain ops).');
   }
 
   // Send config to dashboard
@@ -1058,17 +1710,33 @@ async function main() {
   // Handle Dashboard Commands
   dashboardEmitter.on('command', async (cmd: { command: string; payload: any }) => {
     if (cmd.command === 'toggleDryRun') {
+      // `enabled` is the NEW desired value of dryRun. enabled=false ⇒ go LIVE.
       const enable = cmd.payload.enabled;
-      if (CONFIG.dryRun === !enable) {
-        log('INFO', `Switching to ${!enable ? 'LIVE' : 'DRY RUN'} mode... (Requested by user)`);
+      const wantDryRun = !!enable;
+      const wantLive = !wantDryRun;
+      const emitCurrentConfig = (dryRun: boolean) => dashboardEmitter.updateConfig({
+        capital: CONFIG.capital, risk: CONFIG.risk,
+        smartMoney: { ...CONFIG.smartMoney }, arbitrage: { ...CONFIG.arbitrage },
+        dipArb: { ...CONFIG.dipArb }, directTrading: { ...CONFIG.directTrading },
+        binance: { ...CONFIG.binance }, dryRun,
+      });
+      if (CONFIG.dryRun !== wantDryRun) {
+        // SAFETY GATE: switching to LIVE from the dashboard must NOT be possible by
+        // accident. Require a real signing key AND an explicit out-of-band opt-in.
+        // Without both we refuse and stay in dry-run — no path to silent real orders.
+        if (wantLive) {
+          const hasKey = !!(process.env.POLYMARKET_PRIVATE_KEY && process.env.POLYMARKET_PRIVATE_KEY.length >= 64);
+          const optedIn = process.env.ALLOW_LIVE_TOGGLE === 'true';
+          if (!hasKey || !optedIn) {
+            log('ERROR', `🚫 LIVE toggle REFUSED — ${!hasKey ? 'no POLYMARKET_PRIVATE_KEY' : 'ALLOW_LIVE_TOGGLE != true'}. Staying in DRY RUN.`);
+            emitCurrentConfig(true); // force the dashboard back to DRY RUN
+            return;
+          }
+        }
+        log('WARN', `Switching to ${wantLive ? '🔴 LIVE' : '🧪 DRY RUN'} mode... (Requested by user)`);
+        CONFIG.dryRun = wantDryRun;
 
-        // Update Config
-        CONFIG.dryRun = !enable; // payload.enabled is "isLive?" or "isDryRun?" - let's assume payload.enabled is the NEW STATE for dryRun? 
-        // Wait, usually toggles send the new desired state. 
-        // Using "enabled" as "isDryRun enabled"
-        CONFIG.dryRun = !!enable;
-
-        // Update State paper wallet
+        // Ensure a paper wallet exists when entering dry-run.
         if (CONFIG.dryRun && !state.paper) {
           state.paper = {
             balance: CONFIG.capital.totalUsd,
@@ -1079,35 +1747,16 @@ async function main() {
           };
         }
 
-        // Re-configure Services
-
-        // 1. Arbitrage Service (Needs restart to update signer/sim mode)
+        // Re-configure services for the new mode.
+        // 1. Arbitrage Service (re-create to update signer/sim mode).
         if (arbService) {
-          // Update internal flags if possible without full restart? 
-          // ArbitrageService takes readonly config in constructor. Better to re-create.
           await arbService.stop();
-          // Re-run setup
           await setupArbitrage(sdk);
         }
+        // 2. DipArb (live = autoExecute true, if its config is enabled).
+        sdk.dipArb.updateConfig({ autoExecute: !CONFIG.dryRun });
 
-        // 2. DipArb (Update config)
-        sdk.dipArb.updateConfig({
-          autoExecute: !CONFIG.dryRun, // Live = autoExecute true (if config enabled)
-        });
-
-        // Emit new config to dashboard
-        const newDashboardConfig: BotConfig = {
-          capital: CONFIG.capital,
-          risk: CONFIG.risk,
-          smartMoney: { ...CONFIG.smartMoney },
-          arbitrage: { ...CONFIG.arbitrage },
-          dipArb: { ...CONFIG.dipArb },
-          directTrading: { ...CONFIG.directTrading },
-          binance: { ...CONFIG.binance },
-          dryRun: CONFIG.dryRun,
-        };
-        dashboardEmitter.updateConfig(newDashboardConfig);
-
+        emitCurrentConfig(CONFIG.dryRun);
         log('WARN', `⚠️ BOT MODE CHANGED TO: ${CONFIG.dryRun ? '🧪 DRY RUN' : '🔴 LIVE'}`);
       }
     }
@@ -1122,7 +1771,31 @@ async function main() {
       trades: 0,
       totalVolume: 0,
     };
-    log('INFO', '📝 Paper Trading Activated: Simulating trades with $250 initial capital');
+    log('INFO', `📝 Paper Trading Activated: Simulating trades with $${CONFIG.capital.totalUsd} initial capital`);
+
+    // Real PnL paper-trading engine (copy-trading), using the bot's own risk limits.
+    const home = process.env.HOME || '.';
+    const perTradeUsd = parseFloat(process.env.PAPER_PER_TRADE_USD || '') ||
+      Math.max(CONFIG.capital.minOrderUsd, CONFIG.capital.totalUsd * CONFIG.capital.maxPerTradePct);
+    const maxExpPct = parseFloat(process.env.PAPER_MAX_EXPOSURE_PCT || '') || CONFIG.capital.maxTotalExposurePct;
+    paper = new PaperPortfolio({
+      capital: CONFIG.capital.totalUsd,
+      perTradeUsd,
+      maxTotalExposurePct: maxExpPct,
+      maxPerMarketPct: CONFIG.capital.maxPerMarketPct,
+      maxRelativeSlippage: parseFloat(process.env.PAPER_MAX_REL_SLIPPAGE || '0.05'),
+      minEntryPrice: parseFloat(process.env.PAPER_MIN_ENTRY || '0.35'),
+      maxEntryPrice: parseFloat(process.env.PAPER_MAX_ENTRY || '0.97'),
+      minOrderUsd: CONFIG.capital.minOrderUsd,
+      slippage: parseFloat(process.env.PAPER_SLIPPAGE || '0.005'),
+      statePath: `${home}/paper-state.json`,
+      historyPath: `${home}/paper-history.csv`,
+    }, Date.now());
+    // Seed the sync baseline to the paper's ALREADY-realized PnL (it may have
+    // loaded prior state). The persisted risk ledger already reflects that
+    // history, so we must only fold FUTURE realized deltas — not replay the past.
+    lastPaperRealized = paper.realizedPnL;
+    log('INFO', `📄 Paper PnL engine ready ($${perTradeUsd.toFixed(2)}/copy, max exposure ${(maxExpPct * 100).toFixed(0)}%, slippage ${(paper.cfg.slippage * 100).toFixed(2)}¢, live-price + resolution settlement ON)`);
     updateDashboard();
   }
 
@@ -1131,6 +1804,32 @@ async function main() {
   });
 
   log('INFO', `Wallet: ${sdk.tradingService.getAddress()}`);
+
+  // ---- WS observability -------------------------------------------------
+  // Drive the dashboard ACTIVE/badge from REAL WebSocket health, not just
+  // isPaused. The realtime feed is the bot's lifeblood (copy/dipArb signals);
+  // if it silently drops, the dashboard must show it. We track state.wsConnected
+  // off the realtime service's own disconnected/statusChange/connected events.
+  state.wsConnected = sdk.realtime.isConnected?.() ?? false;
+  sdk.realtime.on('connected', () => {
+    state.wsConnected = true;
+    log('INFO', '🔌 Realtime WebSocket connected');
+    updateDashboard();
+  });
+  sdk.realtime.on('disconnected', () => {
+    state.wsConnected = false;
+    log('ERROR', '🔌 Realtime WebSocket DISCONNECTED — signal feed is down until it reconnects');
+    updateDashboard();
+  });
+  sdk.realtime.on('reconnecting', (info: { count: number }) => {
+    log('WARN', `🔌 Realtime WebSocket reconnecting (replaying ${info?.count ?? 0} subscriptions)…`);
+    updateDashboard();
+  });
+  sdk.realtime.on('statusChange', (status: ConnectionStatus) => {
+    state.wsConnected = status === ConnectionStatus.CONNECTED;
+    log('INFO', `🔌 Realtime WebSocket status: ${status}`);
+    updateDashboard();
+  });
 
   // Setup all services
   await setupOnchain(); // MUST BE FIRST (Approvals)
@@ -1141,9 +1840,9 @@ async function main() {
   await setupDipArb(sdk);
 
   // Periodic state update
-  setInterval(() => {
+  track(setInterval(() => {
     updateDashboard();
-  }, 5000);
+  }, 5000));
 
   // Setup Direct Trading
   await setupDirectTrading(sdk);
@@ -1163,19 +1862,16 @@ async function main() {
       }
 
       try {
-        // Estimate PnL before closing (using cached data)
+        // Realized PnL of this manual close = (real exit price − avg entry) × size.
+        // We read the freshest REAL price the portfolio sync enriched onto the
+        // position (curPrice). NO FALLBACK to a fabricated price: if we have no
+        // real price we record 0 only when entry is also unknown, and otherwise
+        // surface the gap rather than inventing a number.
         const position = state.positions.find(p => p.asset === tokenId);
-        let estimatedPnL = 0;
-        if (position) {
-          const entryPrice = Number(position.avgPrice) || 0;
-          // Use current market price if available, otherwise assume break-even or roughly current avg
-          // Ideally we'd have the live mid-price. 'curPrice' might be in position if enriched.
-          const exitPrice = Number((position as any).curPrice) || Number(position.msg_price) || 0;
-
-          if (exitPrice > 0) {
-            estimatedPnL = (exitPrice - entryPrice) * size;
-          }
-        }
+        const entryPrice = position ? Number(position.avgPrice) || 0 : 0;
+        const markPrice = position
+          ? (Number((position as any).curPrice) || Number(position.msg_price) || 0)
+          : 0;
 
         const res = await sdk.tradingService.createMarketOrder({
           tokenId,
@@ -1184,13 +1880,26 @@ async function main() {
         });
 
         if (res.success) {
-          log('TRADE', `✅ Position closed: ${size} shares sold`);
-          if (estimatedPnL !== 0) {
-            recordTrade(estimatedPnL, 'manual');
-            log('INFO', `Realized PnL (Est): $${estimatedPnL.toFixed(2)}`);
+          // Prefer the REAL fill price/size from the order; fall back to the fresh
+          // pre-trade mark (curPrice), never a fabricated number.
+          const exitPrice = (res.avgPrice && res.avgPrice > 0) ? res.avgPrice : markPrice;
+          const filledSize = (res.filledSize && res.filledSize > 0) ? res.filledSize : size;
+          log('TRADE', `✅ Position closed: ${filledSize.toFixed(2)} shares sold @ ${exitPrice > 0 ? exitPrice.toFixed(3) : 'n/a'}`);
+          if (exitPrice > 0 && entryPrice > 0) {
+            const realized = (exitPrice - entryPrice) * filledSize;
+            recordTrade(realized, 'direct', {
+              market: tokenId,
+              side: 'SELL',
+              size: filledSize,
+              price: exitPrice,
+              txHash: res.transactionHashes?.[0],
+            });
+            log('INFO', `Realized PnL: $${realized.toFixed(2)} (exit ${exitPrice.toFixed(3)} vs entry ${entryPrice.toFixed(3)})`);
+          } else {
+            log('ERROR', `Position closed but realized PnL could not be computed (exit=${exitPrice}, entry=${entryPrice}) — NOT recording a fabricated number. token=${tokenId}`);
           }
         } else {
-          log('WARN', `❌ Close failed: ${res.errorMsg}`);
+          log('ERROR', `❌ Close failed: ${res.errorMsg}`);
         }
       } catch (err: any) {
         log('WARN', `❌ Close error: ${err.message}`);
@@ -1371,12 +2080,64 @@ async function main() {
     }
   });
 
-  process.on('SIGINT', async () => {
-    console.log('\n\nShutting down...');
-    if (arbService) await arbService.stop();
-    await sdk.dipArb.stop();
-    sdk.stop();
-    process.exit(0);
+  // ---- Unified shutdown -------------------------------------------------
+  // Single teardown path for SIGINT, SIGTERM, uncaughtException and
+  // unhandledRejection. Flush the paper portfolio, the risk ledger, persist the
+  // session summary, stop services and clear ALL tracked timers. `shuttingDown`
+  // guards against re-entry when several signals fire at once.
+  let shuttingDown = false;
+  async function shutdown(reason: string, exitCode = 0): Promise<void> {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n\nShutting down (${reason})...`);
+
+    // Stop all tracked pollers first so nothing fires mid-teardown.
+    for (const t of timers) clearInterval(t);
+
+    // Flush paper portfolio (state + final report).
+    if (paper) {
+      try {
+        paper.save();
+        console.log('\n' + paper.report(Math.round((Date.now() - state.startTime) / 1000 / 60)));
+      } catch (err) {
+        log('ERROR', `Paper save failed on shutdown: ${(err as Error).message}`);
+      }
+    }
+
+    // Persist the risk ledger so a halted/paused bot stays that way on restart.
+    try {
+      saveRiskState();
+    } catch (err) {
+      log('ERROR', `Risk-state save failed on shutdown: ${(err as Error).message}`);
+    }
+
+    // Persist this run's session summary (wires addSession/createSessionFromState).
+    try {
+      const summary = createSessionFromState(state.startTime, state, CONFIG, sessionTrades);
+      addSession(summary);
+      log('INFO', `Session summary saved (PnL $${summary.totalPnL.toFixed(2)}, ${summary.totalTrades} trades).`);
+    } catch (err) {
+      log('ERROR', `Session summary save failed on shutdown: ${(err as Error).message}`);
+    }
+
+    // Stop services.
+    try { if (arbService) await arbService.stop(); } catch (err) { log('ERROR', `arbService.stop failed: ${(err as Error).message}`); }
+    try { await sdk.dipArb.stop(); } catch (err) { log('ERROR', `dipArb.stop failed: ${(err as Error).message}`); }
+    try { sdk.stop(); } catch (err) { log('ERROR', `sdk.stop failed: ${(err as Error).message}`); }
+
+    process.exit(exitCode);
+  }
+
+  process.on('SIGINT', () => { void shutdown('SIGINT'); });
+  process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+  process.on('uncaughtException', (err) => {
+    log('ERROR', `uncaughtException: ${err?.message}`, err?.stack);
+    void shutdown('uncaughtException', 1);
+  });
+  process.on('unhandledRejection', (reason) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    log('ERROR', `unhandledRejection: ${msg}`);
+    void shutdown('unhandledRejection', 1);
   });
 
   log('INFO', '🚀 Bot + Dashboard running! Press Ctrl+C to stop.\n');
@@ -1385,12 +2146,20 @@ async function main() {
   function displayStatus() {
     const runtime = Math.round((Date.now() - state.startTime) / 1000 / 60);
 
+    // WS health drives the badge alongside isPaused: a dropped feed is NOT ACTIVE
+    // even if the bot is otherwise unpaused.
+    const statusBadge = state.permanentlyHalted ? '💀 HALTED'
+      : state.isPaused ? '⏸️ PAUSED'
+        : !state.wsConnected ? '🔌 WS DOWN'
+          : '▶️ ACTIVE';
+
     console.log('\n' + '═'.repeat(70));
     console.log('              POLYMARKET BOT v3.0 STATUS');
     console.log('═'.repeat(70));
     console.log(`  Runtime:        ${runtime} minutes`);
     console.log(`  Mode:           ${CONFIG.dryRun ? '🧪 DRY RUN' : '🔴 LIVE'}`);
-    console.log(`  Status:         ${state.isPaused ? '⏸️ PAUSED' : '▶️ ACTIVE'}`);
+    console.log(`  Status:         ${statusBadge}`);
+    console.log(`  WS Feed:        ${state.wsConnected ? '🟢 connected' : '🔴 disconnected'}`);
     console.log('─'.repeat(70));
     console.log('  BALANCES:');
     console.log(`    MATIC:        ${state.maticBalance.toFixed(4)}`);
@@ -1402,10 +2171,23 @@ async function main() {
     console.log(`    Arbitrage:    ${state.arbTrades} trades`);
     console.log(`    DipArb:       ${state.dipArbTrades} trades`);
     console.log('═'.repeat(70) + '\n');
+
+    // Paper-trading PnL report (the real answer to "how much would I make?")
+    if (paper) {
+      console.log(paper.report(runtime));
+      paper.save();
+      paper.appendHistory(runtime);
+    }
   }
 
-  setInterval(displayStatus, 60000);
+  track(setInterval(displayStatus, 60000));
   displayStatus(); // Initial call
+
+  // Paper-trading resolver loop (mark-to-market + settle resolved markets)
+  if (paper) {
+    track(setInterval(runPaperResolver, 120000));
+    track(setTimeout(runPaperResolver, 20000));
+  }
 }
 
 main().catch((err) => {

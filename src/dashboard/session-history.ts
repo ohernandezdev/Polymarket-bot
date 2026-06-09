@@ -3,7 +3,7 @@
  * Saves and loads trading session history to/from a JSON file
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -126,7 +126,11 @@ export function saveHistory(history: HistoryData): void {
   ensureDataDir();
   
   try {
-    writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
+    // Atomic write: serialize to a temp file then rename, so a crash mid-write can
+    // never leave a half-written / corrupt session-history.json behind.
+    const tmp = `${HISTORY_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(history, null, 2));
+    renameSync(tmp, HISTORY_FILE);
     console.log('[SessionHistory] History saved successfully');
   } catch (error) {
     console.error('[SessionHistory] Error saving history:', error);

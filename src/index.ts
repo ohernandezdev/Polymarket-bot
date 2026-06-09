@@ -448,7 +448,8 @@ export class PolymarketSDK {
       this.realtime,
       this.tradingService,
       {},  // default config
-      this.dataApi  // pass dataApi for report generation
+      this.dataApi,  // pass dataApi for report generation
+      this.markets   // pass MarketService for live orderbook/midpoint drift checks
     );
 
     // Initialize DipArbService

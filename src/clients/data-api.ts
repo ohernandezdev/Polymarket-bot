@@ -7,6 +7,7 @@ import { RateLimiter, ApiType } from '../core/rate-limiter.js';
 import type { UnifiedCache } from '../core/unified-cache.js';
 import { CACHE_TTL } from '../core/unified-cache.js';
 import { PolymarketError } from '../core/errors.js';
+import { fetchWithTimeout } from '../utils/fetch-timeout.js';
 
 const DATA_API_BASE = 'https://data-api.polymarket.com';
 
@@ -436,7 +437,7 @@ export class DataApiClient {
       if (params?.mergeable !== undefined) query.set('mergeable', String(params.mergeable));
       if (params?.title) query.set('title', params.title);
 
-      const response = await fetch(`${DATA_API_BASE}/positions?${query}`);
+      const response = await fetchWithTimeout(`${DATA_API_BASE}/positions?${query}`);
       if (!response.ok)
         throw PolymarketError.fromHttpError(
           response.status,
@@ -487,7 +488,7 @@ export class DataApiClient {
       if (params?.sortBy) query.set('sortBy', params.sortBy);
       if (params?.sortDirection) query.set('sortDirection', params.sortDirection);
 
-      const response = await fetch(`${DATA_API_BASE}/closed-positions?${query}`);
+      const response = await fetchWithTimeout(`${DATA_API_BASE}/closed-positions?${query}`);
       if (!response.ok)
         throw PolymarketError.fromHttpError(
           response.status,
@@ -546,7 +547,7 @@ export class DataApiClient {
       if (params?.sortBy) query.set('sortBy', params.sortBy);
       if (params?.sortDirection) query.set('sortDirection', params.sortDirection);
 
-      const response = await fetch(`${DATA_API_BASE}/activity?${query}`);
+      const response = await fetchWithTimeout(`${DATA_API_BASE}/activity?${query}`);
       if (!response.ok)
         throw PolymarketError.fromHttpError(
           response.status,
@@ -648,7 +649,7 @@ export class DataApiClient {
       if (params?.filterType) query.set('filterType', params.filterType);
       if (params?.filterAmount !== undefined) query.set('filterAmount', String(params.filterAmount));
 
-      const response = await fetch(`${DATA_API_BASE}/trades?${query}`);
+      const response = await fetchWithTimeout(`${DATA_API_BASE}/trades?${query}`);
       if (!response.ok)
         throw PolymarketError.fromHttpError(
           response.status,
@@ -762,7 +763,7 @@ export class DataApiClient {
       if (userName) query.set('userName', userName);
 
       return this.rateLimiter.execute(ApiType.DATA_API, async () => {
-        const response = await fetch(
+        const response = await fetchWithTimeout(
           `${DATA_API_BASE}/v1/leaderboard?${query}`
         );
         if (!response.ok)
@@ -822,7 +823,7 @@ export class DataApiClient {
         markets.forEach((m) => query.append('market', m));
       }
 
-      const response = await fetch(`${DATA_API_BASE}/value?${query}`);
+      const response = await fetchWithTimeout(`${DATA_API_BASE}/value?${query}`);
       if (!response.ok)
         throw PolymarketError.fromHttpError(
           response.status,
@@ -862,7 +863,7 @@ export class DataApiClient {
       const query = new URLSearchParams({ market: params.market });
       if (params.limit !== undefined) query.set('limit', String(params.limit));
 
-      const response = await fetch(`${DATA_API_BASE}/holders?${query}`);
+      const response = await fetchWithTimeout(`${DATA_API_BASE}/holders?${query}`);
       if (!response.ok)
         throw PolymarketError.fromHttpError(
           response.status,
@@ -892,9 +893,9 @@ export class DataApiClient {
         // (non-binary markets have arbitrary outcome names)
         outcomeIndex: typeof p.outcomeIndex === 'number' ? p.outcomeIndex : 0,
 
-        // Position data
-        size: Number(p.size),
-        avgPrice: Number(p.avgPrice),
+        // Position data — `|| 0` so a missing field never propagates NaN into PnL.
+        size: Number(p.size) || 0,
+        avgPrice: Number(p.avgPrice) || 0,
         curPrice: p.curPrice !== undefined ? Number(p.curPrice) : undefined,
         totalBought: p.totalBought !== undefined ? Number(p.totalBought) : undefined,
 

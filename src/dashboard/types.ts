@@ -12,6 +12,9 @@ export interface BotState {
   isPaused: boolean;
   pauseUntil: number;
 
+  // Realtime WebSocket health (drives the dashboard ACTIVE/badge alongside isPaused)
+  wsConnected?: boolean;
+
   // 🔴 NEW v3.1: Enhanced risk tracking
   monthlyPnL: number;
   monthStartTime: number;

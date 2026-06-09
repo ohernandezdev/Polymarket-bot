@@ -612,8 +612,14 @@ export class DipArbService extends EventEmitter {
         const result = await this.tradingService.createMarketOrder(orderParams);
 
         if (result.success) {
-          totalSharesFilled += sharesPerOrder;
-          totalAmountSpent += amountPerOrder;
+          // Use the REAL fill (price/size) from the order when the CLOB reports it,
+          // so avgPrice/profit reflect reality. The old code accumulated the ASSUMED
+          // targetPrice every time → avgPrice always == targetPrice, slippage always
+          // 0, and the later merge() could request more pairs than actually held.
+          const fillShares = (result.filledSize && result.filledSize > 0) ? result.filledSize : sharesPerOrder;
+          const fillPrice = (result.avgPrice && result.avgPrice > 0) ? result.avgPrice : signal.targetPrice;
+          totalSharesFilled += fillShares;
+          totalAmountSpent += fillShares * fillPrice;
           lastOrderId = result.orderId;
         } else {
           failedOrders++;
@@ -742,8 +748,12 @@ export class DipArbService extends EventEmitter {
         const result = await this.tradingService.createMarketOrder(orderParams);
 
         if (result.success) {
-          totalSharesFilled += sharesPerOrder;
-          totalAmountSpent += amountPerOrder;
+          // Real fill (price/size) when reported — see Leg1 note. Prevents a
+          // fabricated avgPrice and an over-sized merge() against phantom shares.
+          const fillShares = (result.filledSize && result.filledSize > 0) ? result.filledSize : sharesPerOrder;
+          const fillPrice = (result.avgPrice && result.avgPrice > 0) ? result.avgPrice : signal.targetPrice;
+          totalSharesFilled += fillShares;
+          totalAmountSpent += fillShares * fillPrice;
           lastOrderId = result.orderId;
         } else {
           failedOrders++;
@@ -1141,30 +1151,43 @@ export class DipArbService extends EventEmitter {
     try {
       this.log(`Selling ${leg1.shares} ${leg1.side} tokens...`);
 
-      // Get current price for the token
+      // Get current price for the token. NO 0.5 fallback: without a real bid we
+      // cannot value the exit, so we ABORT rather than sell into a fabricated price.
       const currentPrice = leg1.side === 'UP'
-        ? (this.upAsks[0]?.price ?? 0.5)
-        : (this.downAsks[0]?.price ?? 0.5);
+        ? this.upAsks[0]?.price
+        : this.downAsks[0]?.price;
 
-      const exitAmount = leg1.shares * currentPrice;
-
-      // 检查退出金额是否满足最低限额
-      if (exitAmount < 1) {
-        this.log(`⚠️ Exit amount ($${exitAmount.toFixed(2)}) below $1 minimum - position will be held to expiry`);
+      if (!(typeof currentPrice === 'number' && currentPrice > 0)) {
+        this.log(`⚠️ No live price for ${leg1.side} — cannot value exit, holding to expiry`);
         return {
           success: false,
           leg: 'exit',
           roundId: this.currentRound.roundId,
-          error: `Exit amount ($${exitAmount.toFixed(2)}) below Polymarket minimum ($1) - holding to expiry`,
+          error: `No live price for ${leg1.side} leg — holding to expiry`,
           executionTimeMs: Date.now() - startTime,
         };
       }
 
-      // Market sell the position
+      // USDC value of the exit (for the $1 minimum check only).
+      const exitValue = leg1.shares * currentPrice;
+      if (exitValue < 1) {
+        this.log(`⚠️ Exit value ($${exitValue.toFixed(2)}) below $1 minimum - position will be held to expiry`);
+        return {
+          success: false,
+          leg: 'exit',
+          roundId: this.currentRound.roundId,
+          error: `Exit value ($${exitValue.toFixed(2)}) below Polymarket minimum ($1) - holding to expiry`,
+          executionTimeMs: Date.now() - startTime,
+        };
+      }
+
+      // Market SELL: `amount` is SHARES, not USDC. Selling `shares*price` USDC-worth
+      // of shares (the old bug) liquidated only ~half the position, leaving the rest
+      // un-hedged exactly when the hedge had failed.
       const result = await this.tradingService.createMarketOrder({
         tokenId: leg1.tokenId,
         side: 'SELL' as Side,
-        amount: exitAmount,
+        amount: leg1.shares,
       });
 
       if (result.success) {

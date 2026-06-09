@@ -148,6 +148,8 @@ export function calculateSharesForAmount(
   amount: number,
   price: number
 ): number {
+  // A non-positive price yields Infinity/NaN shares — return 0 (no valid sizing).
+  if (!(price > 0)) return 0;
   return roundSize(amount / price);
 }
 
@@ -298,10 +300,12 @@ export function calculatePnL(
       ? (currentPrice - entryPrice) * size
       : (entryPrice - currentPrice) * size;
 
-  const pnlPercent =
-    side === 'long'
-      ? ((currentPrice - entryPrice) / entryPrice) * 100
-      : ((entryPrice - currentPrice) / entryPrice) * 100;
+  // Guard division by a zero/negative entry (resolved-loser entry = 0 → Infinity %).
+  const pnlPercent = entryPrice > 0
+    ? (side === 'long'
+        ? ((currentPrice - entryPrice) / entryPrice) * 100
+        : ((entryPrice - currentPrice) / entryPrice) * 100)
+    : 0;
 
   return { pnl, pnlPercent };
 }

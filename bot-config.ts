@@ -25,15 +25,23 @@
  */
 
 import 'dotenv/config';
+import { ethers } from 'ethers';
 import {
   PolymarketSDK,
   ArbitrageService,
   OnchainService,
   BridgeClient,
+  USDC_CONTRACT,
   type SmartMoneyTrade,
   type SmartMoneyLeaderboardEntry,
   type BinanceKLine,
 } from './src/index.js';
+import { getPolygonProvider } from './src/utils/provider.js';
+// Realized-history qualification (settled markets only — never unrealized
+// mark-to-market). getRealizedStats / RealizedStats are the sibling agent's
+// newSymbols on WalletService; RealizedStats is not re-exported from the SDK
+// barrel, so we import it directly from the service module.
+import type { RealizedStats } from './src/services/wallet-service.js';
 
 // ============================================================================
 // CONFIGURATION
@@ -76,22 +84,25 @@ const CONFIG = {
   smartMoney: {
     enabled: true,
     topN: 20,
-    // 🔴 FIXED: Stricter criteria
-    minWinRate: 0.60,  // Up from 0.50 to 60%
-    minPnl: 500,       // Up from 100 to $500
-    minTrades: 30,     // Up from 20 to 30
+    // 🔴 FIXED: Stricter criteria (all evaluated against REALIZED history)
+    minWinRate: 0.60,  // Up from 0.50 to 60% — realized win ratio over closed trades
+    minPnl: 500,       // Up from 100 to $500 — realized PnL (USDC)
 
     // 🔴 NEW: Quality filters
-    minProfitFactor: 1.5,  // Total wins / total losses >= 1.5x
-    minConsistencyScore: 0.7,  // Recent performance score
-    maxSingleTradeExposure: 0.3,  // Max 30% of PnL from one trade
-    checkLastNTrades: 10,  // Analyze last 10 trades for consistency
+    minProfitFactor: 1.5,  // Realized gross wins / gross losses >= 1.5x
+    minConsistencyScore: 0.7,  // Realized win ratio floor (consistency proxy)
+    maxSingleTradeExposure: 0.3,  // Max 30% of realized turnover from one trade
+
+    // 🔴 Q4: Real-data minimum-trades gate. Driven by the count of CLOSED
+    // (settled) positions from getRealizedStats — NOT the API's tradeCount
+    // field, which returns null and always evaluated to 0 (dead gate).
+    minClosedTrades: 30,  // Require >=30 settled markets of realized history
 
     sizeScale: 0.1,
     maxSizePerTrade: 15,
     maxSlippage: 0.03,
     minTradeSize: 10,
-    delay: 500,
+    delay: 0,  // 🔴 Q9: zero copy delay — react to followed trades immediately
     // ADD YOUR CUSTOM WALLETS HERE (will be followed in addition to leaderboard)
     customWallets: [
       '0xc2e7800b5af46e6093872b177b7a5e7f0563be51',  // Top Polymarket trader
@@ -336,6 +347,17 @@ function canTrade(): boolean {
     return false;
   }
 
+  // 🔴 Q3: Layer 5 — consecutive-loss circuit breaker. After N losing trades
+  // in a row, pause for the standard cooldown so a losing streak cannot keep
+  // compounding before the daily/drawdown limits ever trip.
+  if (state.consecutiveLosses >= CONFIG.risk.maxConsecutiveLosses) {
+    state.isPaused = true;
+    state.pauseUntil = Date.now() + CONFIG.risk.pauseOnBreachMinutes * 60 * 1000;
+    log('WARN', `Consecutive-loss breaker tripped: ${state.consecutiveLosses} losses in a row (limit: ${CONFIG.risk.maxConsecutiveLosses})`);
+    log('WARN', `Bot paused for ${CONFIG.risk.pauseOnBreachMinutes} minutes`);
+    return false;
+  }
+
   return true;
 }
 
@@ -389,6 +411,68 @@ function calculatePositionSize(baseSize: number): number {
   return size;
 }
 
+/**
+ * Read the live, on-chain deployable USDC balance for the trading wallet.
+ *
+ * Used so exposure caps bind against REAL capital rather than the static
+ * CONFIG.capital.totalUsd number. Uses getPolygonProvider() so we never spam
+ * the "could not detect network" error and never construct an ad-hoc provider.
+ *
+ * NO FALLBACK: if the on-chain read fails we throw — the caller must not size a
+ * live trade off a fabricated balance.
+ */
+async function getDeployableUsdc(walletAddress: string): Promise<number> {
+  const provider = getPolygonProvider();
+  // USDC_CONTRACT is Polygon USDC.e (bridged) — the collateral Polymarket CTF
+  // settles in. Single source of truth, imported from the SDK barrel.
+  const erc20Abi = ['function balanceOf(address) view returns (uint256)'];
+  const usdc = new ethers.Contract(USDC_CONTRACT, erc20Abi, provider);
+  const raw: ethers.BigNumber = await usdc.balanceOf(walletAddress);
+  // USDC has 6 decimals.
+  return parseFloat(ethers.utils.formatUnits(raw, 6));
+}
+
+/**
+ * Resolve the final per-trade USDC cap for the smart-money copier, wiring the
+ * dynamic sizing engine (calculatePositionSize) together with ALL THREE static
+ * exposure caps. This is the single source of truth for "how big can one copy
+ * trade be right now".
+ *
+ *   1. calculatePositionSize() → dynamic fraction (streak-adjusted, floored/capped)
+ *   2. maxPerTradePct          → hard ceiling per single trade
+ *   3. maxPerMarketPct         → hard ceiling on total dollars in one market
+ *   4. maxTotalExposurePct     → hard ceiling on total deployed capital
+ *
+ * The narrowest of these (against live deployable capital) wins.
+ */
+async function resolveMaxSizePerTradeUsd(walletAddress: string): Promise<number> {
+  // Bind against the smaller of configured capital and live on-chain balance,
+  // so we never size trades off capital we no longer hold.
+  const onChainUsdc = await getDeployableUsdc(walletAddress);
+  const deployable = Math.min(CONFIG.capital.totalUsd, onChainUsdc);
+
+  // Dynamic per-trade fraction from the performance engine.
+  const dynamicFraction = calculatePositionSize(CONFIG.capital.maxPerTradePct);
+
+  // Cap the per-trade fraction by the configured per-trade ceiling.
+  const perTradeFraction = Math.min(dynamicFraction, CONFIG.capital.maxPerTradePct);
+
+  // Translate the three exposure caps into absolute USDC ceilings.
+  const perTradeCapUsd = deployable * perTradeFraction;
+  const perMarketCapUsd = deployable * CONFIG.capital.maxPerMarketPct;
+  const totalExposureCapUsd = deployable * CONFIG.capital.maxTotalExposurePct;
+
+  // The smart-money copier opens one position per copied trade, so a single
+  // trade must respect per-trade AND per-market AND aggregate-exposure ceilings.
+  let cap = Math.min(perTradeCapUsd, perMarketCapUsd, totalExposureCapUsd);
+
+  // Never below the protocol/strategy minimum order.
+  cap = Math.max(cap, CONFIG.capital.minOrderUsd);
+
+  log('WALLET', `Per-trade cap resolved: $${cap.toFixed(2)} (deployable $${deployable.toFixed(2)}, dyn ${(perTradeFraction * 100).toFixed(2)}%, perMarket $${perMarketCapUsd.toFixed(2)}, totalExp $${totalExposureCapUsd.toFixed(2)})`);
+  return cap;
+}
+
 // ============================================================================
 // 1. SMART MONEY STRATEGY
 // ============================================================================
@@ -411,61 +495,71 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
   const leaderboard = await sdk.smartMoney.getLeaderboard({ limit: CONFIG.smartMoney.topN * 2 });
 
   for (const entry of leaderboard.entries) {
+    // 🔴 C5/S1: Score qualification on REALIZED history (settled markets) only.
+    // winRate / profitFactor / consistency / whale-exposure are ALL derived from
+    // getRealizedStats (the closed-positions / realizedPnl basis), never from
+    // open-position unrealized cashPnl which re-prices every tick and inflates
+    // losers that have not settled yet.
+    // 🔴 Q10: NO swallowing catch. If a wallet's realized history can't be
+    // fetched we cannot trust the qualified set, so we surface the error and
+    // abort qualification rather than silently following a partial set.
+    let stats: RealizedStats;
     try {
-      const positions = await sdk.dataApi.getPositions(entry.address);
+      // 🔴 Q4: min-trades gate driven by REAL closed-trade count. The service
+      // marks insufficientHistory when closedTrades < minClosedTrades — that is
+      // the live replacement for the dead `entry.tradeCount` gate (tradeCount
+      // returns null → always 0, so the old gate never passed).
+      stats = await sdk.wallets.getRealizedStats(entry.address, CONFIG.smartMoney.minClosedTrades);
+    } catch (err) {
+      log('ERROR', `Smart Money qualification aborted — realized stats failed for ${entry.address}: ${(err as Error).message}`);
+      throw err;  // do not operate on a partial qualified set
+    }
 
-      if (positions.length < CONFIG.smartMoney.minTrades) {
-        continue;  // Skip if not enough trades
+    // 🔴 Q4: Insufficient settled history → cannot judge. Skip (do NOT reject as
+    // 0%, per the service contract), defer the wallet rather than follow blind.
+    if (stats.insufficientHistory) {
+      if (CONFIG.dryRun) {
+        log('WALLET', `❌ ${entry.address.slice(0, 10)}... SKIPPED: closedTrades:${stats.closedTrades}<${CONFIG.smartMoney.minClosedTrades} (insufficient settled history)`);
       }
-
-      // Calculate basic stats
-      const wins = positions.filter(p => (p.cashPnl ?? 0) > 0);
-      const losses = positions.filter(p => (p.cashPnl ?? 0) < 0);
-      const winRate = positions.length > 0 ? wins.length / positions.length : 0;
-
-      // 🔴 NEW: Profit Factor (total wins / total losses)
-      const totalWins = wins.reduce((sum, p) => sum + Math.abs(p.cashPnl ?? 0), 0);
-      const totalLosses = losses.reduce((sum, p) => sum + Math.abs(p.cashPnl ?? 0), 0);
-      const profitFactor = totalLosses > 0 ? totalWins / totalLosses : (totalWins > 0 ? 999 : 0);
-
-      // 🔴 NEW: Check for whale trades (single trade dominance)
-      const sortedPnl = positions.map(p => Math.abs(p.cashPnl ?? 0)).sort((a, b) => b - a);
-      const biggestTrade = sortedPnl[0] ?? 0;
-      const totalAbsPnl = sortedPnl.reduce((s, v) => s + v, 0);
-      const singleTradeExposure = totalAbsPnl > 0 ? biggestTrade / totalAbsPnl : 0;
-
-      // 🔴 NEW: Consistency score (last N trades performance)
-      const lastNTrades = positions.slice(0, CONFIG.smartMoney.checkLastNTrades);
-      const recentWins = lastNTrades.filter(p => (p.cashPnl ?? 0) > 0).length;
-      const consistencyScore = lastNTrades.length > 0 ? recentWins / lastNTrades.length : 0;
-
-      // Apply ALL filters
-      const passesWinRate = winRate >= CONFIG.smartMoney.minWinRate;
-      const passesPnl = entry.pnl >= CONFIG.smartMoney.minPnl;
-      const passesTrades = (entry.tradeCount || 0) >= CONFIG.smartMoney.minTrades;
-      const passesProfitFactor = profitFactor >= CONFIG.smartMoney.minProfitFactor;
-      const passesConsistency = consistencyScore >= CONFIG.smartMoney.minConsistencyScore;
-      const passesWhaleCheck = singleTradeExposure <= CONFIG.smartMoney.maxSingleTradeExposure;
-
-      if (passesWinRate && passesPnl && passesTrades && passesProfitFactor && passesConsistency && passesWhaleCheck) {
-        if (!qualified.includes(entry.address)) {
-          qualified.push(entry.address);
-          log('WALLET', `✅ ${entry.address.slice(0, 10)}... WR:${(winRate * 100).toFixed(0)}% PF:${profitFactor.toFixed(2)}x Consistency:${(consistencyScore * 100).toFixed(0)}% PnL:$${entry.pnl}`);
-        }
-      } else {
-        // Log why wallet was rejected (in debug mode)
-        const failures = [];
-        if (!passesWinRate) failures.push(`WR:${(winRate * 100).toFixed(0)}%<${(CONFIG.smartMoney.minWinRate * 100).toFixed(0)}%`);
-        if (!passesProfitFactor) failures.push(`PF:${profitFactor.toFixed(2)}<${CONFIG.smartMoney.minProfitFactor}`);
-        if (!passesConsistency) failures.push(`Cons:${(consistencyScore * 100).toFixed(0)}%<${(CONFIG.smartMoney.minConsistencyScore * 100).toFixed(0)}%`);
-        if (!passesWhaleCheck) failures.push(`Whale:${(singleTradeExposure * 100).toFixed(0)}%>${(CONFIG.smartMoney.maxSingleTradeExposure * 100).toFixed(0)}%`);
-        if (CONFIG.dryRun && failures.length > 0) {
-          log('WALLET', `❌ ${entry.address.slice(0, 10)}... REJECTED: ${failures.join(', ')}`);
-        }
-      }
-
       await new Promise(r => setTimeout(r, 200));
-    } catch { /* skip */ }
+      continue;
+    }
+
+    // Realized-history derived consistency: win ratio over closed trades.
+    const consistencyScore = stats.winRate;
+    // Realized-history derived single-trade dominance: the largest single
+    // realized move (win or loss) as a fraction of total realized turnover.
+    const totalRealizedTurnover = stats.grossProfit + stats.grossLoss;
+    const singleTradeExposure = totalRealizedTurnover > 0
+      ? Math.max(stats.maxWin, stats.maxLoss) / totalRealizedTurnover
+      : 0;
+
+    // Apply ALL filters (all realized-history derived)
+    const passesWinRate = stats.winRate >= CONFIG.smartMoney.minWinRate;
+    const passesPnl = stats.realizedPnL >= CONFIG.smartMoney.minPnl;
+    const passesProfitFactor = stats.profitFactor >= CONFIG.smartMoney.minProfitFactor;
+    const passesConsistency = consistencyScore >= CONFIG.smartMoney.minConsistencyScore;
+    const passesWhaleCheck = singleTradeExposure <= CONFIG.smartMoney.maxSingleTradeExposure;
+
+    if (passesWinRate && passesPnl && passesProfitFactor && passesConsistency && passesWhaleCheck) {
+      if (!qualified.includes(entry.address)) {
+        qualified.push(entry.address);
+        log('WALLET', `✅ ${entry.address.slice(0, 10)}... WR:${(stats.winRate * 100).toFixed(0)}% PF:${stats.profitFactor.toFixed(2)}x Whale:${(singleTradeExposure * 100).toFixed(0)}% RealizedPnL:$${stats.realizedPnL.toFixed(0)} (${stats.closedTrades} closed)`);
+      }
+    } else {
+      // Log why wallet was rejected (in debug mode)
+      const failures = [];
+      if (!passesWinRate) failures.push(`WR:${(stats.winRate * 100).toFixed(0)}%<${(CONFIG.smartMoney.minWinRate * 100).toFixed(0)}%`);
+      if (!passesPnl) failures.push(`PnL:$${stats.realizedPnL.toFixed(0)}<$${CONFIG.smartMoney.minPnl}`);
+      if (!passesProfitFactor) failures.push(`PF:${stats.profitFactor.toFixed(2)}<${CONFIG.smartMoney.minProfitFactor}`);
+      if (!passesConsistency) failures.push(`Cons:${(consistencyScore * 100).toFixed(0)}%<${(CONFIG.smartMoney.minConsistencyScore * 100).toFixed(0)}%`);
+      if (!passesWhaleCheck) failures.push(`Whale:${(singleTradeExposure * 100).toFixed(0)}%>${(CONFIG.smartMoney.maxSingleTradeExposure * 100).toFixed(0)}%`);
+      if (CONFIG.dryRun && failures.length > 0) {
+        log('WALLET', `❌ ${entry.address.slice(0, 10)}... REJECTED: ${failures.join(', ')}`);
+      }
+    }
+
+    await new Promise(r => setTimeout(r, 200));
   }
 
   if (qualified.length === 0) {
@@ -477,10 +571,16 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
   log('WALLET', `Following ${qualified.length} wallets`);
 
   if (!CONFIG.dryRun) {
+    // 🔴 Wire the dynamic sizing engine + all three exposure caps into the
+    // actual per-trade ceiling, bound to live on-chain deployable capital.
+    // Honors the static maxSizePerTrade as an additional hard ceiling.
+    const dynamicCapUsd = await resolveMaxSizePerTradeUsd(sdk.tradingService.getAddress());
+    const maxSizePerTrade = Math.min(dynamicCapUsd, CONFIG.smartMoney.maxSizePerTrade);
+
     await sdk.smartMoney.startAutoCopyTrading({
       targetAddresses: qualified,
       sizeScale: CONFIG.smartMoney.sizeScale,
-      maxSizePerTrade: CONFIG.smartMoney.maxSizePerTrade,
+      maxSizePerTrade,
       maxSlippage: CONFIG.smartMoney.maxSlippage,
       minTradeSize: CONFIG.smartMoney.minTradeSize,
       delay: CONFIG.smartMoney.delay,

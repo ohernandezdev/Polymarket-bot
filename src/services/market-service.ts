@@ -1512,7 +1512,8 @@ export class MarketService {
     const tokens: UnifiedMarketToken[] = clob.tokens.map((t, index) => ({
       tokenId: t.tokenId,
       outcome: t.outcome,
-      price: t.price || gamma.outcomePrices[index] || 0.5,
+      // No fake 0.5: CLOB price wins; else Gamma's; else NaN (invalid → caller discards).
+      price: t.price || (gamma.outcomePrices[index] ?? NaN),
       winner: t.winner,
     }));
 
@@ -1541,8 +1542,9 @@ export class MarketService {
     // This supports Yes/No, Up/Down, Team1/Team2, Heads/Tails, etc.
     const outcomes = gamma.outcomes || ['Yes', 'No'];
     const tokens: UnifiedMarketToken[] = [
-      { tokenId: '', outcome: outcomes[0], price: gamma.outcomePrices[0] || 0.5 },
-      { tokenId: '', outcome: outcomes[1], price: gamma.outcomePrices[1] || 0.5 },
+      // No fake 0.5: missing price → NaN (caller discards). `??` preserves a legit 0.
+      { tokenId: '', outcome: outcomes[0], price: gamma.outcomePrices[0] ?? NaN },
+      { tokenId: '', outcome: outcomes[1], price: gamma.outcomePrices[1] ?? NaN },
     ];
 
     return {

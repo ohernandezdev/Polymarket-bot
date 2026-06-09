@@ -14,6 +14,7 @@
 
 import { RateLimiter, ApiType } from '../core/rate-limiter.js';
 import type { UnifiedCache } from '../core/unified-cache.js';
+import { fetchWithTimeout } from '../utils/fetch-timeout.js';
 
 // ==================== 端点配置 ====================
 
@@ -158,7 +159,7 @@ export class SubgraphClient {
 
     // 限流并执行请求
     const data = await this.rateLimiter.execute(ApiType.SUBGRAPH, async () => {
-      const response = await fetch(endpoint, {
+      const response = await fetchWithTimeout(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: queryStr }),

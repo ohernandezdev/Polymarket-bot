@@ -32,8 +32,14 @@ function broadcast(message: WebSocketMessage): void {
 
 export function startDashboard(port = 3001): http.Server {
   server = http.createServer((req, res) => {
-    // CORS headers
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    // CORS headers — the server binds to 127.0.0.1, so ONLY reflect a localhost
+    // origin. A wildcard `*` let ANY website the operator visited read the bot's
+    // state via http://127.0.0.1:3001/api/* from their browser. No wildcard.
+    const origin = req.headers.origin;
+    if (origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
@@ -97,7 +103,16 @@ export function startDashboard(port = 3001): http.Server {
 
     // Serve static files from dashboard/dist
     const distPath = path.resolve(__dirname, '../../dashboard/dist');
-    let filePath = path.join(distPath, url.pathname === '/' ? 'index.html' : url.pathname);
+    // Decode + normalize, then CONFINE to distPath. Without this, `..%2f..%2f` could
+    // escape the web root and serve arbitrary files (path traversal).
+    let decodedPath: string;
+    try { decodedPath = decodeURIComponent(url.pathname); } catch { decodedPath = url.pathname; }
+    let filePath = path.resolve(distPath, '.' + (decodedPath === '/' ? '/index.html' : decodedPath));
+    if (filePath !== distPath && !filePath.startsWith(distPath + path.sep)) {
+      res.writeHead(403);
+      res.end('Forbidden');
+      return;
+    }
 
     // Check if file exists
     if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
@@ -146,6 +161,24 @@ export function startDashboard(port = 3001): http.Server {
       try {
         const message = JSON.parse(data.toString());
         if (message.type === 'command') {
+          // SECURITY: privileged commands (toggleDryRun->LIVE, closePosition,
+          // redeemPosition) are gated behind a shared secret. FAIL CLOSED:
+          // if DASHBOARD_SECRET is unset, or the client did not send a
+          // matching secret, the command is rejected and never re-emitted.
+          const expectedSecret = process.env.DASHBOARD_SECRET;
+          if (!expectedSecret) {
+            console.warn(
+              `[Dashboard] WARN: rejected command '${message.command}' — DASHBOARD_SECRET is not configured. ` +
+                `Set DASHBOARD_SECRET in the environment to enable control commands.`
+            );
+            return;
+          }
+          if (message.secret !== expectedSecret) {
+            console.warn(
+              `[Dashboard] WARN: rejected command '${message.command}' — missing or invalid shared secret.`
+            );
+            return;
+          }
           console.log(`[Dashboard] Command received: ${message.command}`, message.payload);
           dashboardEmitter.emit('command', { command: message.command, payload: message.payload });
         }
@@ -176,9 +209,13 @@ export function startDashboard(port = 3001): http.Server {
     broadcast({ type: 'config', payload: config });
   });
 
-  server.listen(port, () => {
-    console.log(`[Dashboard] Server running at http://localhost:${port}`);
-    console.log(`[Dashboard] WebSocket at ws://localhost:${port}`);
+  // SECURITY: bind to loopback only (127.0.0.1) so the control channel is not
+  // reachable from the network. Do NOT change this to 0.0.0.0 — the WebSocket
+  // accepts privileged commands and there is no transport-level auth here.
+  const HOST = '127.0.0.1';
+  server.listen(port, HOST, () => {
+    console.log(`[Dashboard] Server running at http://${HOST}:${port}`);
+    console.log(`[Dashboard] WebSocket at ws://${HOST}:${port}`);
   });
 
   return server;

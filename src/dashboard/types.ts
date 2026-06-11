@@ -26,6 +26,7 @@ export interface BotState {
 
   // Strategy stats
   smartMoneyTrades: number;
+  smartMoneySkippedCategory?: number; // copies skipped by the category blocklist
   arbTrades: number;
   dipArbTrades: number;
   directTrades: number;

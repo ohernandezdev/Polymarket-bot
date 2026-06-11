@@ -64,6 +64,10 @@ export interface PaperConfig {
   maxRelativeSlippage: number;  // skip if slippage/price exceeds this, e.g. 0.05
   minEntryPrice: number;        // skip BUY copies below this price, e.g. 0.35
   maxEntryPrice: number;        // skip BUY copies above this price, e.g. 0.97
+  allowAveraging: boolean;      // if false, a BUY on a market we already hold is skipped
+                                // (caps each market at 1× base — kills the oversized losers)
+  stopLossPct: number;          // close a position when mark drops this fraction below
+                                // entry (0 = disabled). e.g. 0.5 cuts at -50% vs riding to -100%
   minOrderUsd: number;          // e.g. 5
   slippage: number;             // absolute price haircut, e.g. 0.005
   statePath: string;
@@ -92,6 +96,8 @@ export class PaperPortfolio {
   skippedSlippage = 0;
   skippedConcentration = 0;
   skippedPriceBand = 0;
+  skippedAveraging = 0;
+  stoppedOut = 0;
   startMs: number;
 
   constructor(cfg: PaperConfig, nowMs: number) {
@@ -145,6 +151,36 @@ export class PaperPortfolio {
     if (p && price > 0 && price < 1) { p.lastPrice = price; this.updateDrawdown(); }
   }
 
+  /**
+   * Stop-loss: if a position's mark has fallen `stopLossPct` below its entry, close
+   * it NOW at the mark instead of riding it to a possible $0. Palanca #2 del test —
+   * el perdedor promedio (−$6.43) era 2.9× el ganador (+$2.24); cortar la cola de
+   * pérdidas grandes ataca esa asimetría. Returns true if it closed the position.
+   */
+  maybeStopLoss(tokenId: string, markPrice: number): boolean {
+    if (!(this.cfg.stopLossPct > 0)) return false;
+    const p = this.positions.get(tokenId);
+    if (!p || !(markPrice > 0 && markPrice < 1)) return false;
+    const drop = (p.avgEntry - markPrice) / p.avgEntry;
+    if (drop < this.cfg.stopLossPct) return false;
+    const exit = markPrice;
+    const proceeds = p.shares * exit;
+    const pnl = p.shares * (exit - p.avgEntry);
+    this.cash += proceeds;
+    this.realizedPnL += pnl;
+    this.realizedFromSold += pnl;
+    this.losses++;
+    this.stoppedOut++;
+    this.closed.push({
+      market: p.market, slug: p.slug, shares: p.shares,
+      entry: p.avgEntry, exit, pnl, reason: 'sold',
+      closedAt: new Date().toISOString(),
+    });
+    this.positions.delete(tokenId);
+    this.updateDrawdown();
+    return true;
+  }
+
   /** Settle a resolved position. payout = 1 (win) or 0 (loss); void uses last price. */
   settle(tokenId: string, payout: number, reason: 'resolved' | 'resolved-void' = 'resolved') {
     const p = this.positions.get(tokenId);
@@ -189,6 +225,13 @@ export class PaperPortfolio {
       if (raw < this.cfg.minEntryPrice || raw > this.cfg.maxEntryPrice) {
         this.skippedPriceBand++;
         return 'skip:priceband';
+      }
+      // No averaging-up (palanca #1 del test de 57h): las posiciones que se ampliaron
+      // a 2-3× base fueron −$35 (más que TODA la pérdida realizada −$29.52). Si ya
+      // tenemos la posición, ignoramos copias adicionales → cada mercado capeado a 1×.
+      if (existing && !this.cfg.allowAveraging) {
+        this.skippedAveraging++;
+        return 'skip:already-held';
       }
       const entry = Math.min(0.999, raw + slip); // pay UP — conservative
       const alloc = Math.min(Math.max(this.cfg.perTradeUsd, this.cfg.minOrderUsd), this.cash);
@@ -303,8 +346,9 @@ export class PaperPortfolio {
       skipped: {
         noCash: this.skippedNoCash, exposure: this.skippedExposure, badPrice: this.skippedBadPrice,
         slippage: this.skippedSlippage, concentration: this.skippedConcentration,
-        priceBand: this.skippedPriceBand,
+        priceBand: this.skippedPriceBand, averaging: this.skippedAveraging,
       },
+      stoppedOut: this.stoppedOut,
     };
   }
 
@@ -325,7 +369,8 @@ export class PaperPortfolio {
     L.push(`  Closed trades:    ${s.closedTrades}  (W:${s.wins} L:${s.losses})  Win rate: ${s.winRate.toFixed(1)}%  | resolved: ${s.resolvedCount}`);
     L.push(`  Copies: BUY ${s.buysCopied} / SELL ${s.sellsCopied}`);
     L.push(`  Max drawdown:     ${s.maxDrawdownPct.toFixed(2)}%`);
-    L.push(`  Skipped cash/exposure/price/slippage/concentration/priceBand: ${s.skipped.noCash}/${s.skipped.exposure}/${s.skipped.badPrice}/${s.skipped.slippage}/${s.skipped.concentration}/${s.skipped.priceBand}`);
+    L.push(`  Skipped cash/exposure/price/slippage/concentration/priceBand/averaging: ${s.skipped.noCash}/${s.skipped.exposure}/${s.skipped.badPrice}/${s.skipped.slippage}/${s.skipped.concentration}/${s.skipped.priceBand}/${s.skipped.averaging}`);
+    L.push(`  Stop-loss cierres: ${s.stoppedOut}  | averaging ${this.cfg.allowAveraging ? 'ON' : 'OFF'}  | stopLoss ${this.cfg.stopLossPct > 0 ? (this.cfg.stopLossPct * 100).toFixed(0) + '%' : 'OFF'}`);
     L.push(`  Banda de entrada: [${this.cfg.minEntryPrice.toFixed(2)} – ${this.cfg.maxEntryPrice.toFixed(2)}]`);
     L.push(`  Assumptions: slippage ${(this.cfg.slippage * 100).toFixed(2)}¢/share, $${this.cfg.perTradeUsd}/copy, max exposure ${(this.cfg.maxTotalExposurePct * 100).toFixed(0)}%`);
     L.push('═'.repeat(70));
@@ -344,7 +389,8 @@ export class PaperPortfolio {
       buysCopied: this.buysCopied, sellsCopied: this.sellsCopied,
       skippedNoCash: this.skippedNoCash, skippedExposure: this.skippedExposure, skippedBadPrice: this.skippedBadPrice,
       skippedSlippage: this.skippedSlippage, skippedConcentration: this.skippedConcentration,
-      skippedPriceBand: this.skippedPriceBand,
+      skippedPriceBand: this.skippedPriceBand, skippedAveraging: this.skippedAveraging,
+      stoppedOut: this.stoppedOut,
       startMs: this.startMs, positions: posArr, closed: this.closed.slice(-800),
     };
     try { writeFileSync(this.cfg.statePath, JSON.stringify(data, null, 2)); } catch { /* non-fatal */ }
@@ -388,6 +434,8 @@ export class PaperPortfolio {
       this.skippedSlippage = d.skippedSlippage ?? 0;
       this.skippedConcentration = d.skippedConcentration ?? 0;
       this.skippedPriceBand = d.skippedPriceBand ?? 0;
+      this.skippedAveraging = d.skippedAveraging ?? 0;
+      this.stoppedOut = d.stoppedOut ?? 0;
       this.startMs = d.startMs ?? this.startMs;
       this.closed = d.closed ?? [];
       this.positions = new Map((d.positions ?? []).map((p: Position) => {

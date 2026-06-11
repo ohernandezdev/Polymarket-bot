@@ -399,6 +399,8 @@ async function main(): Promise<void> {
     maxRelativeSlippage: parseFloat(process.env.BACKTEST_MAX_REL_SLIPPAGE || '0.05'),
     minEntryPrice: parseFloat(process.env.BACKTEST_MIN_ENTRY || '0.35'),
     maxEntryPrice: parseFloat(process.env.BACKTEST_MAX_ENTRY || '0.97'),
+    allowAveraging: process.env.BACKTEST_ALLOW_AVERAGING === 'true',
+    stopLossPct: parseFloat(process.env.BACKTEST_STOP_LOSS_PCT || '0.5'),
     minOrderUsd: BACKTEST_MIN_ORDER_USD,
     slippage: BACKTEST_SLIPPAGE,
     statePath: `${scratchBase}.state.json`,

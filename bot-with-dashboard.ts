@@ -773,6 +773,19 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
 
         const label = `${trade.marketSlug || 'mkt'}${trade.outcome ? ':' + trade.outcome : ''}`;
 
+        // Category blocklist (palanca #3 del test 57h): ATP 0/5 −$25, MLB 0/2, LoL 0/1
+        // sangraron en seco; CS2/ITF/KBO/Elon fueron netos positivos. Saltamos las
+        // categorías que han demostrado pérdida sistemática (env SM_CATEGORY_BLOCKLIST).
+        const blocked = (process.env.SM_CATEGORY_BLOCKLIST ?? 'atp,mlb,lol')
+          .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+        const catMatch = (trade.marketSlug || '').toLowerCase().match(/^([a-z0-9]+)/);
+        const category = catMatch ? catMatch[1] : '';
+        if (category && blocked.includes(category)) {
+          state.smartMoneySkippedCategory = (state.smartMoneySkippedCategory ?? 0) + 1;
+          log('TRADE', `[PAPER] skip:category(${category}) ${label.slice(0, 40)}`);
+          return;
+        }
+
         if (CONFIG.dryRun) {
           // DRY-RUN execution → isolated PaperPortfolio. PnL is recorded at
           // SETTLEMENT by runPaperResolver (resolution) / onSignal SELL (close),
@@ -1606,7 +1619,18 @@ async function runPaperResolver() {
           // been pinned at an extreme (≥0.99 / ≤0.01) for PIN_CYCLES_TO_SETTLE
           // consecutive resolver passes (~6 min) — a concluded outcome, settled at
           // its REAL pinned payout (1 or 0), never a fabricated mid.
-          if (px > 0 && px < 1) paper.markPrice(tokenId, px);
+          if (px > 0 && px < 1) {
+            paper.markPrice(tokenId, px);
+            // Stop-loss: cut a position that has fallen too far below entry instead
+            // of riding it to $0. If it triggers, the position is gone — skip the
+            // rest of this token's pass.
+            if (paper.maybeStopLoss(tokenId, px)) {
+              log('TRADE', `[PAPER] 🛑 STOP-LOSS ${(mk.slug || tokenId).slice(0, 40)} @ ${px.toFixed(3)}`);
+              pinnedCycles.delete(tokenId);
+              await new Promise(res => setTimeout(res, 150));
+              continue;
+            }
+          }
           const pinned = px >= 0.99 || px <= 0.01;
           if (pinned) {
             const n = (pinnedCycles.get(tokenId) || 0) + 1;
@@ -1786,6 +1810,8 @@ async function main() {
       maxRelativeSlippage: parseFloat(process.env.PAPER_MAX_REL_SLIPPAGE || '0.05'),
       minEntryPrice: parseFloat(process.env.PAPER_MIN_ENTRY || '0.35'),
       maxEntryPrice: parseFloat(process.env.PAPER_MAX_ENTRY || '0.97'),
+      allowAveraging: process.env.PAPER_ALLOW_AVERAGING === 'true', // default OFF (no averaging-up)
+      stopLossPct: parseFloat(process.env.PAPER_STOP_LOSS_PCT || '0.5'), // cut at -50% vs riding to -100%
       minOrderUsd: CONFIG.capital.minOrderUsd,
       slippage: parseFloat(process.env.PAPER_SLIPPAGE || '0.005'),
       statePath: `${home}/paper-state.json`,
